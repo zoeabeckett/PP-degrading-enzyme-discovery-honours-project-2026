@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 # Configuration
-INPUT_FILE  = "uniref_identity_0_5_iron_AND_Oxygena_2026_03_18.fasta"  
+INPUT_FILE  = "uniprotkb_iron_AND_oxygenase_OR_dioxyge_2026_03_18.fasta"  
 OUTPUT_FILE = "cdhit_clustered"   
 
 
