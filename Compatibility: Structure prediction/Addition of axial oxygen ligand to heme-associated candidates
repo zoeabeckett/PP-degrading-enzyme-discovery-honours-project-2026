@@ -1,0 +1,141 @@
+#Placing axial oxygen ligand on heme-associated candidates on Boltz-predicted complex 
+import os
+import glob
+import warnings
+import numpy as np
+from Bio.PDB import PDBParser, PDBIO, Select, Atom
+from Bio import BiopythonWarning
+
+warnings.simplefilter('ignore', BiopythonWarning)
+
+
+INPUT_DIR = "/home/s_zoe/GNINA_axial_oxygen_all_structures/base_files_receptors_autobox/receptors"
+OUTPUT_DIR = "/home/s_zoe/GNINA_axial_oxygen_all_structures/base_files_receptors_autobox/GNINA_OXYGEN_PLACED_receptors"
+
+class ReceptorSelect(Select):
+    def accept_residue(self, residue):
+        chain_id = residue.get_parent().id
+        if chain_id in ['A', 'B']:
+            return True
+        return False
+
+def build_oxo_ferryl(structure, filename):
+    model = structure[0]
+    heme_res = None
+    fe_atom = None
+    
+    # Locate iron atom 
+    for chain in model:
+        for res in chain:
+            if res.get_resname().upper() in ['HEM', 'HET', 'LIG']:
+                for atom in res:
+                    if atom.element.upper() == 'FE' or atom.name.strip().upper() == 'FE':
+                        heme_res = res
+                        fe_atom = atom
+                        break
+            if fe_atom: break
+        if fe_atom: break
+        
+    if not fe_atom:
+        print(f"{filename}: No Iron found.")
+        return False
+
+    fe_coord = np.array(fe_atom.coord)
+
+    # Find coordinating N atoms in heme
+    n_atoms = [a for a in heme_res if a.element.upper() == 'N' or a.name.strip().upper().startswith('N')]
+    n_atoms.sort(key=lambda a: np.linalg.norm(np.array(a.coord) - fe_coord))
+    
+    if len(n_atoms) < 4:
+        print(f"{filename}: Could not find 4 coordinating nitrogens in Heme.")
+        return False
+        
+    pyrrole_ns = n_atoms[:4]
+
+    # Calculate the normal vector to the Heme plane
+    v1 = np.array(pyrrole_ns[0].coord) - fe_coord
+    
+
+    v2 = None
+    for n in pyrrole_ns[1:]:
+        vec = np.array(n.coord) - fe_coord
+        # If dot product is small, they are roughly orthogonal
+        if abs(np.dot(v1, vec)) < (np.linalg.norm(v1) * np.linalg.norm(vec) * 0.5):
+            v2 = vec
+            break
+            
+    if v2 is None:
+        v2 = np.array(pyrrole_ns[1].coord) - fe_coord
+
+    # Cross product gives the perpendicular normal vector
+    normal = np.cross(v1, v2)
+    normal = normal / np.linalg.norm(normal) 
+
+    # Find the proximal ligand ensure axial ligand is placed correctly 
+    proximal_atom = None
+    min_prox_dist = 999.0
+    
+    for chain in model:
+        if chain == heme_res.get_parent(): 
+            continue 
+        for res in chain:
+            for atom in res:
+                dist = np.linalg.norm(np.array(atom.coord) - fe_coord)
+                if dist < min_prox_dist:
+                    min_prox_dist = dist
+                    proximal_atom = atom
+
+    if proximal_atom:
+        prox_vec = np.array(proximal_atom.coord) - fe_coord
+        # If the normal vector points towards the proximal ligand, flip it 180 degrees
+        if np.dot(normal, prox_vec) > 0:
+            normal = -normal
+
+    # Calculate final coordinates: 1.65 Angstroms along the normal vector
+    o_coord = fe_coord + (normal * 1.65)
+
+    # Add the axial oxygen ligand 
+    new_oxygen = Atom.Atom("OAX", o_coord, 0.0, 1.0, " ", " OAX", 9999, "O")
+    heme_res.add(new_oxygen)
+    
+    print(f"   Placed OAX at 1.65A perpendicular to Iron atom.")
+    return True
+
+def process_pdb(pdb_path):
+    filename = os.path.basename(pdb_path)
+    base_name = os.path.splitext(filename)[0]
+    
+    receptor_out = os.path.join(OUTPUT_DIR, f"{base_name}_Compound1.pdb")
+
+    parser = PDBParser(QUIET=True)
+    try:
+        structure = parser.get_structure(base_name, pdb_path)
+    except Exception as e:
+        print(f"Error parsing {filename}: {e}")
+        return
+
+    success = build_oxo_ferryl(structure, filename)
+    
+    if success:
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(receptor_out, ReceptorSelect())
+        print(f"{base_name}: Compound I structure generated.")
+
+def main():
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+        
+    pdb_files = glob.glob(os.path.join(INPUT_DIR, "*.pdb"))
+    if not pdb_files:
+        print("No PDB files found.")
+        return
+
+    print(f"Processing {len(pdb_files)} files to build Compound I...")
+    for pdb_path in pdb_files:
+        if "_Compound1" in pdb_path:
+            continue
+        process_pdb(pdb_path)
+
+if __name__ == "__main__":
+    main()
