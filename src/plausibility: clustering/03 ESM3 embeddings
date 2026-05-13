@@ -21,6 +21,7 @@ else:
     device = torch.device("cpu")
     print("WARNING: Running on CPU.")
 
+#Load model 
 print(f"Loading {model_name} to {device}...")
 model: ESM3InferenceClient = ESM3.from_pretrained(model_name).to(device)
 model.float() 
@@ -33,7 +34,7 @@ total_sequences = sum(1 for _ in SeqIO.parse(fasta_file, "fasta"))
 print(f"Found {total_sequences} sequences. Starting run...")
 
 records = SeqIO.parse(fasta_file, "fasta")
-
+# Processing loop
 for record in tqdm(records, total=total_sequences, unit="seq"):
     header = record.id
     sequence = str(record.seq)
@@ -49,12 +50,13 @@ for record in tqdm(records, total=total_sequences, unit="seq"):
     
     try:
         with torch.no_grad():
+            # 1. Encode 
             protein_tensor = model.encode(protein)
-            
+            # 2. Prepare input 
             sequence_tokens = protein_tensor.sequence.unsqueeze(0).to(device)
-            
+            # 3. Forward pass
             output = model.forward(sequence_tokens=sequence_tokens)
-            
+            # 4. Extract embeddings 
             embeddings = output.embeddings.squeeze(0).cpu()
             mean_embedding = embeddings.mean(dim=0)
 
