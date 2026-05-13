@@ -1,0 +1,165 @@
+# plot Fe-C distance against pLDDT, creates a scatter plot to generate target zone candidates that meet all thresholds
+#!/usr/bin/env python3
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+import matplotlib.ticker as ticker
+from scipy.stats import pearsonr
+
+# Config
+INPUT_CSV    = "input csv with data"
+OUTPUT_PNG   = "09.1_scatter_plddt_vs_distance.png"
+DPI          = 200
+CNN_THRESH   = 0.5
+X_PAD        = 1.0
+
+BG       = "white"
+AX_BG    = "#F7F7F7"
+TEXT     = "#111111"
+GRID     = "#DDDDDD"
+SPINE    = "#AAAAAA"
+ANNOT_BG = "#EEEEEE"
+
+
+
+def load_data(path):
+    df = pd.read_csv(path)
+
+    if df["complex_plddt"].max() <= 1.0:
+        df["complex_plddt"]  *= 100
+    if df["complex_iplddt"].max() <= 1.0:
+        df["complex_iplddt"] *= 100
+
+    print(f" Loaded {len(df)} candidates from {path}")
+    return df
+
+
+def plot(df):
+    fig, ax = plt.subplots(figsize=(11, 7))
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(AX_BG)
+
+    # Third metric CNN score, addition to the plot
+    cnn_col = "Mean_CNNscore"
+    if cnn_col not in df.columns:
+        for alt in ["Mean_CNNscore", "CNNscore", "cnn_score"]:
+            if alt in df.columns:
+                cnn_col = alt
+                break
+        else:
+            print(f"[WARN] No CNN score column found — all points drawn as circles.")
+            cnn_col = None
+
+    if cnn_col:
+        mask_pass = df[cnn_col] >= CNN_THRESH
+        mask_fail = ~mask_pass
+    else:
+        mask_pass = pd.Series([True]  * len(df))
+        mask_fail = pd.Series([False] * len(df))
+
+    vmin = df["complex_iplddt"].min()
+    vmax = df["complex_iplddt"].max()
+
+   
+    sc = None
+    if mask_pass.any():
+        sc = ax.scatter(
+            df.loc[mask_pass, "Mean_MinDist_Fe"],
+            df.loc[mask_pass, "complex_plddt"],
+            c=df.loc[mask_pass, "complex_iplddt"],
+            cmap="plasma", vmin=vmin, vmax=vmax,
+            marker="o",
+            s=70,
+            alpha=0.90,
+            linewidths=0.4,
+            edgecolors="#555555",
+            zorder=3,
+        )
+
+
+    sc_tri = None
+    if mask_fail.any():
+        sc_tri = ax.scatter(
+            df.loc[mask_fail, "Mean_MinDist_Fe"],
+            df.loc[mask_fail, "complex_plddt"],
+            c=df.loc[mask_fail, "complex_iplddt"],
+            cmap="plasma", vmin=vmin, vmax=vmax,
+            marker="^",
+            s=75,
+            alpha=0.80,
+            linewidths=0.4,
+            edgecolors="#555555",
+            zorder=3,
+        )
+
+    # Formatting graph 
+    mappable = sc if sc is not None else sc_tri
+    cbar = fig.colorbar(mappable, ax=ax, pad=0.02)
+    cbar.set_label("Boltz complex ipLDDT (0–100)", color=TEXT, fontsize=10)
+    cbar.ax.yaxis.set_tick_params(color=TEXT)
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color=TEXT)
+    cbar.outline.set_edgecolor(SPINE)
+
+
+    x_min = df["Mean_MinDist_Fe"].min() - X_PAD
+    x_max = df["Mean_MinDist_Fe"].max() + X_PAD
+    ax.set_xlim(x_min, x_max)
+
+    # Pearson model annotation 
+    r, p = pearsonr(df["Mean_MinDist_Fe"], df["complex_plddt"])
+    ax.text(0.02, 0.98,
+            f"Pearson r = {r:.3f}  (p = {p:.2e})\nn = {len(df)} candidates",
+            transform=ax.transAxes, color=TEXT, fontsize=10,
+            va="bottom", ha="left",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor=ANNOT_BG, alpha=0.9,
+                      edgecolor=SPINE))
+
+    # Threshold lines plotted 
+    ax.axvline(5.0, color="#0277BD", linewidth=1.5, linestyle="--", alpha=0.8, zorder=2)
+    ax.text(4.05, ax.get_ylim()[0] + 1.5, "5 Å cutoff",
+            color="#0277BD", fontsize=9)
+
+    ax.axhline(80, color="#388E3C", linewidth=1.5, linestyle="--", alpha=0.8, zorder=2)
+    ax.text(x_min + 0.05, 80.8, "pLDDT > 80",
+            color="#388E3C", fontsize=9)
+
+    # Shade the "good" region
+    y_lo, y_hi = ax.get_ylim()
+    ax.axvspan(x_min, 5.0,
+               ymin=(80 - y_lo) / (y_hi - y_lo),
+               alpha=0.08, color="#388E3C", zorder=1)
+
+    # Create legend 
+    legend_handles = [
+        mlines.Line2D([], [], color="#333333", marker="o", linestyle="None",
+                      markersize=8, label=f"CNN ≥ {CNN_THRESH}  (circle)"),
+        mlines.Line2D([], [], color="#333333", marker="^", linestyle="None",
+                      markersize=8, label=f"CNN < {CNN_THRESH}  (triangle)"),
+        mlines.Line2D([], [], color="#388E3C", linewidth=0, marker="s",
+                      markersize=10, alpha=0.4, label="Target zone"),
+    ]
+    ax.legend(handles=legend_handles,
+              facecolor=ANNOT_BG, edgecolor=SPINE,
+              labelcolor=TEXT, fontsize=9, loc="lower right")
+
+    # Labels of plot 
+    ax.set_xlabel("Average Minimum Distance C from Fe (Å)", color=TEXT, fontsize=12)
+    ax.set_ylabel("Boltz complex pLDDT (0–100)", color=TEXT, fontsize=12)
+
+    for spine in ax.spines.values():
+        spine.set_edgecolor(SPINE)
+    ax.tick_params(colors=TEXT)
+    ax.grid(color=GRID, linewidth=0.6, zorder=1)
+
+    plt.tight_layout()
+    plt.savefig(OUTPUT_PNG, dpi=DPI, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"Saved: {OUTPUT_PNG}")
+
+
+if __name__ == "__main__":
+    df = load_data(INPUT_CSV)
+    plot(df)
+    print("\nDone!")
