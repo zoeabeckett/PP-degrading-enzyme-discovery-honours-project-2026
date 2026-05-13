@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""
+
+Creates a 2OG.mol2 file for each candidate by:
+  1. Extracting 2OG heavy atoms from the candidate's fixed PDB
+  2. Adding hydrogens with obabel
+  3. Writing a new mol2 using candidate BB's template (charges, bonds, atom types)
+     but with each candidate's own coordinates
+"""
+
+import os
+import sys
+import glob
+import re
+import subprocess
+import shutil
+
+
+CANDIDATES_DIR  = "/home/s_zoe/T_2OG_MD/2OG_holo_MD/2OG_MD_renamed_holo_structures_and_FE"
+OUTPUT_BASE     = "/home/s_zoe/T_2OG_MD/2OG_holo_MD/03_outputs_2OG"
+TEMPLATE_MOL2   = "/home/s_zoe/T_2OG_MD/2OG_holo_MD/02_output_drMD/candidate_BB_holo_full_structure/00_prep/2OG/2OG.mol2"
+TEMPLATE_FRCMOD = "/home/s_zoe/T_2OG_MD/2OG_holo_MD/02_output_drMD/candidate_BB_holo_full_structure/00_prep/2OG/2OG.frcmod"
+
+
+CANDIDATE_PATTERN = re.compile(r"candidate_([^_]+)_holo_full_structure\.pdb$", re.IGNORECASE)
+
+
+# Mol2 parsing
+
+def parse_mol2_atoms(mol2_path):
+    atoms = []
+    in_atom_section = False
+    with open(mol2_path) as f:
+        for line in f:
+            if line.strip() == "@<TRIPOS>ATOM":
+                in_atom_section = True
+                continue
+            if line.startswith("@<TRIPOS>") and in_atom_section:
+                break
+            if in_atom_section and line.strip():
+                parts = line.split()
+                atoms.append({
+                    "idx":     parts[0],
+                    "name":    parts[1],
+                    "x":       float(parts[2]),
+                    "y":       float(parts[3]),
+                    "z":       float(parts[4]),
+                    "type":    parts[5],
+                    "resnum":  parts[6],
+                    "resname": parts[7],
+                    "charge":  parts[8] if len(parts) > 8 else "0.0",
+                    "extra":   parts[9] if len(parts) > 9 else ""
+                })
+    return atoms
+
+
+def read_mol2_sections(mol2_path):
+    sections = {}
+    section_order = []
+    current_section = None
+    current_lines = []
+    with open(mol2_path) as f:
+        for line in f:
+            if line.startswith("@<TRIPOS>"):
+                if current_section:
+                    sections[current_section] = current_lines
+                current_section = line.strip()
+                section_order.append(current_section)
+                current_lines = []
+            else:
+                current_lines.append(line)
+        if current_section:
+            sections[current_section] = current_lines
+    return sections, section_order
+
+
+
+def extract_2og_pdb(pdb_path, output_path):
+    """Extract 2OG atoms from candidate PDB into a separate file."""
+    with open(pdb_path) as f:
+        lines = f.readlines()
+    og_lines = [l for l in lines
+                if (l.startswith("ATOM") or l.startswith("HETATM"))
+                and l[17:20].strip() == "2OG"]
+    with open(output_path, 'w') as f:
+        f.writelines(og_lines)
+        f.write("END\n")
+    return len(og_lines)
+
+
+def add_hydrogens_obabel(input_pdb, output_pdb):
+    result = subprocess.run(
+        ["obabel", input_pdb, "-O", output_pdb, "-h", "--unique"],
+        capture_output=True, text=True
+    )
+    return os.path.exists(output_pdb) and os.path.getsize(output_pdb) > 0
+
+
+def parse_coords_from_pdb(pdb_path):
+    coords = {}
+    with open(pdb_path) as f:
+        for line in f:
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                atom_name = line[12:16].strip()
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords[atom_name] = (x, y, z)
+                except ValueError:
+                    continue
+    return coords
+
+
+# Substitute coordinates 
+
+def write_mol2_with_new_coords(template_mol2, heavy_coords, h_coords, output_mol2):
+    """Write mol2 using template topology/charges/types but candidate coordinates."""
+    sections, section_order = read_mol2_sections(template_mol2)
+    template_atoms = parse_mol2_atoms(template_mol2)
+
+    new_atom_lines = []
+    unmatched_heavy = []
+    unmatched_h = []
+
+    for atom in template_atoms:
+        name = atom["name"]
+        is_hydrogen = atom["type"].startswith("h") or name.startswith("H")
+
+        if not is_hydrogen:
+            if name in heavy_coords:
+                x, y, z = heavy_coords[name]
+            else:
+                x, y, z = atom["x"], atom["y"], atom["z"]
+                unmatched_heavy.append(name)
+        else:
+            if name in h_coords:
+                x, y, z = h_coords[name]
+            else:
+                x, y, z = atom["x"], atom["y"], atom["z"]
+                unmatched_h.append(name)
+
+        extra = f" {atom['extra']}" if atom['extra'] else ""
+        line = (f"{atom['idx']:>6} {name:<8} {x:>10.4f} {y:>10.4f} {z:>10.4f} "
+                f"{atom['type']:<6} {atom['resnum']:>3} {atom['resname']:<8} "
+                f"{atom['charge']:>10}{extra}\n")
+        new_atom_lines.append(line)
+
+    if unmatched_heavy:
+        print(f"    WARNING: {len(unmatched_heavy)} heavy atoms used template coords: {unmatched_heavy}")
+    if unmatched_h:
+        print(f"    Note: {len(unmatched_h)} H atoms used template coords (OK - tleap will rebuild)")
+
+    with open(output_mol2, 'w') as f:
+        for section_name in section_order:
+            f.write(f"{section_name}\n")
+            if section_name == "@<TRIPOS>ATOM":
+                f.writelines(new_atom_lines)
+            else:
+                f.writelines(sections[section_name])
+
+    return len(unmatched_heavy)
+
+
+# Main
+
+def main():
+    for path in [TEMPLATE_MOL2, TEMPLATE_FRCMOD]:
+        if not os.path.exists(path):
+            print(f"ERROR: Template file not found: {path}")
+            sys.exit(1)
+
+    template_atoms = parse_mol2_atoms(TEMPLATE_MOL2)
+    heavy_names = [a["name"] for a in template_atoms if not a["type"].startswith("h")]
+    h_names     = [a["name"] for a in template_atoms if a["type"].startswith("h")]
+    print(f"Template: {len(heavy_names)} heavy atoms, {len(h_names)} hydrogens")
+    print(f"Template mol2:   {TEMPLATE_MOL2}")
+    print(f"Template frcmod: {TEMPLATE_FRCMOD}\n")
+
+    all_pdb_files = glob.glob(os.path.join(CANDIDATES_DIR, "*.pdb"))
+
+    candidate_files = []
+    skipped = []
+    for pdb_file in sorted(all_pdb_files):
+        basename = os.path.basename(pdb_file)
+        match = CANDIDATE_PATTERN.match(basename)
+        if match:
+            candidate_files.append((pdb_file, match.group(1)))
+        else:
+            skipped.append(basename)
+
+    if skipped:
+        print(f"Skipped {len(skipped)} file(s) not matching expected pattern:")
+        for s in skipped:
+            print(f"  - {s}")
+        print()
+
+    if not candidate_files:
+        print(f"No matching candidate PDB files found in {CANDIDATES_DIR}")
+        sys.exit(1)
+
+    print(f"Found {len(candidate_files)} candidate PDB file(s)\n")
+
+    success = 0
+    failed = []
+
+    for pdb_file, candidate_id in candidate_files:
+        basename = os.path.basename(pdb_file).replace(".pdb", "")
+        print(f"--- [{candidate_id}] {basename} ---")
+
+        out_dir       = os.path.join(OUTPUT_BASE, basename, "00_prep", "2OG")
+        og_pdb        = os.path.join(out_dir, "2OG.pdb")
+        og_pdb_h      = os.path.join(out_dir, "2OG_H.pdb")
+        output_mol2   = os.path.join(out_dir, "2OG.mol2")
+        output_frcmod = os.path.join(out_dir, "2OG.frcmod")
+
+        if os.path.exists(output_mol2) and os.path.exists(output_frcmod):
+            print(f"  Already exists - skipping")
+            success += 1
+            continue
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Extract 2OG heavy atoms
+        n_heavy = extract_2og_pdb(pdb_file, og_pdb)
+        print(f"  Extracted {n_heavy} 2OG heavy atoms")
+        if n_heavy == 0:
+            print(f"  ERROR: no 2OG atoms found")
+            failed.append(f"{candidate_id} (no 2OG found)")
+            continue
+
+        # Add hydrogens
+        print(f"  Adding hydrogens with obabel...")
+        if not add_hydrogens_obabel(og_pdb, og_pdb_h):
+            print(f"  ERROR: obabel failed")
+            failed.append(f"{candidate_id} (obabel failed)")
+            continue
+
+        # Parse coordinates
+        heavy_coords = parse_coords_from_pdb(og_pdb)
+        all_coords   = parse_coords_from_pdb(og_pdb_h)
+        h_coords     = {k: v for k, v in all_coords.items() if k not in heavy_coords}
+        print(f"  Heavy: {len(heavy_coords)}, H: {len(h_coords)}")
+
+        # Substitute coordinates into template
+        n_unmatched = write_mol2_with_new_coords(
+            TEMPLATE_MOL2, heavy_coords, h_coords, output_mol2
+        )
+
+        # Copy frcmod
+        shutil.copy(TEMPLATE_FRCMOD, output_frcmod)
+        print(f"  Copied: 2OG.frcmod")
+
+        if n_unmatched == 0:
+            print(f"  SUCCESS")
+        else:
+            print(f"  SUCCESS with warnings - {n_unmatched} heavy atoms used template coords")
+        success += 1
+
+    print(f"\n{'='*50}")
+    print(f"SUMMARY: {success} succeeded, {len(failed)} failed")
+    if failed:
+        for f in failed:
+            print(f"  - {f}")
+
+
+if __name__ == "__main__":
+    main()
