@@ -1,0 +1,210 @@
+#!/bin/bash
+# run in Linux
+
+
+# Builds topologies for systems with 2-oxoglutarate (2OG) and Iron (FE).
+
+
+set -euo pipefail
+
+# --- SETTINGS ---
+CANDIDATES=("positive_control")
+CANDIDATES_ROOT="03_outputs_UNKs_positive_control"
+PREP_SUBDIR="00_prep/UNK"
+
+
+COFACTOR_DIR="path" 
+COFACTOR_FRCMOD="2OG.frcmod"
+COFACTOR_MOL2="2OG.mol2"
+
+if [[ $# -gt 0 ]]; then CANDIDATES=("$@"); fi
+
+
+echo "  Step 2: Build Topologies (Non-Heme: 2OG + FE)"
+
+
+# Fix/remove old runs
+
+rm -f mmpbsa_results/*/*.prmtop mmpbsa_results/*/*.inpcrd mmpbsa_results/*/*.tleap mmpbsa_results/*/*.log
+
+for name in "${CANDIDATES[@]}"; do
+    out_dir="mmpbsa_results/${name}"
+    param_dir="${CANDIDATES_ROOT}/${name}_full_structure/${PREP_SUBDIR}"
+    orig_pdb="${name}/trajectory_${name}_holo.pdb"
+    
+
+    echo "  Candidate: ${name}"
+
+
+    if [[ ! -f "$orig_pdb" ]]; then
+        echo "  MISSING input PDB: $orig_pdb"
+        echo "  Check your path: /home/s_zoe/T_positive_control_MD/Analysing_MD/gibbs_free_energy/${name}/"
+        continue
+    fi
+
+    echo "  Standardizing PDBs (Fixing H->H1, handling 2OG and Iron)..."
+    python3 - << PYEOF
+import sys
+import os
+
+ION_NAMES = {"Cl", "CL", "Cl-", "CL-", "Na", "NA", "Na+", "NA+", 
+             "K", "K+", "Mg", "MG", "Mg2+", "Ca", "CA", "Ca2+",
+             "Zn", "ZN", "Zn2+", "Fe", "FE", "Fe2+", "Fe3+"}
+
+def fix_pdb(in_file, out_file):
+    if not os.path.exists(in_file): return
+    
+    first_prot_res = None
+    current_resnum_in = None
+    current_resnum_out = 0
+    
+    with open(in_file, 'r') as f_in, open(out_file, 'w') as f_out:
+        for line in f_in:
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                resname_raw = line[17:20].strip()
+                resnum_in = line[22:26]
+                atom_name = line[12:16].strip()
+                
+                increment_res = False
+                if current_resnum_in != resnum_in:
+                    increment_res = True
+                
+                if resname_raw in ["HOH", "WAT", "TIP", "TIP3"] and atom_name in ["O", "OW", "OH2"]:
+                    increment_res = True
+                if resname_raw in ION_NAMES:
+                    increment_res = True
+                    
+                if increment_res:
+                    current_resnum_in = resnum_in
+                    current_resnum_out += 1
+                    
+                resnum_wrapped = ((current_resnum_out - 1) % 9999) + 1
+                resnum_str = f"{resnum_wrapped:4d}"
+
+                resname = resname_raw
+                if resname == "UNK": resname = "LIG"
+                if resname == "HIS": resname = "HIE"
+                
+                if resname in ["Cl", "CL", "Cl-", "CL-"]:
+                    resname, atom_name = "Cl-", "Cl-"
+                elif resname in ["Na", "NA", "Na+", "NA+"]:
+                    resname, atom_name = "Na+", "Na+"
+                elif resname in ["Fe", "FE", "Fe2+", "Fe3+"]:
+                    resname, atom_name = "FE", "FE"
+                elif resname in ["Mg", "MG", "Mg2+"]:
+                    resname, atom_name = "MG", "MG"
+                    
+                if resname in ["HOH", "WAT", "TIP", "TIP3"]:
+                    resname = "WAT"
+                    if atom_name in ["O", "OW", "OH2"]: atom_name = "O"
+                    elif atom_name in ["H1", "HW1"]: atom_name = "H1"
+                    elif atom_name in ["H2", "HW2"]: atom_name = "H2"
+                
+                if resname not in ["LIG", "2OG", "FE", "WAT", "Na+", "Cl-", "K+", "MG"]:
+                    if first_prot_res is None:
+                        first_prot_res = current_resnum_in
+                    if current_resnum_in == first_prot_res and atom_name == "H":
+                        atom_name = "H1"
+                        
+                if len(atom_name) < 4 and not atom_name[0].isdigit():
+                    fmt_atom = f" {atom_name:<3}"
+                else:
+                    fmt_atom = f"{atom_name:<4}"
+                    
+                line = f"{line[:12]}{fmt_atom}{line[16:17]}{resname:<3} {line[21]}{resnum_str}{line[26:]}"
+            f_out.write(line)
+
+out_dir = "mmpbsa_results/${name}"
+orig_pdb = "${name}/trajectory_${name}_holo.pdb"
+
+fix_pdb(orig_pdb, f"{out_dir}/complex_solv_input.pdb")
+fix_pdb(f"{out_dir}/complex_clean.pdb", f"{out_dir}/complex_dry_input.pdb")
+fix_pdb(f"{out_dir}/receptor_clean.pdb", f"{out_dir}/receptor_dry_input.pdb")
+fix_pdb(f"{out_dir}/ligand_clean.pdb", f"{out_dir}/ligand_dry_input.pdb")
+PYEOF
+
+    # Generate tleap script
+    cat > "${out_dir}/build_topology.tleap" << EOF
+source leaprc.protein.ff14SB
+source leaprc.water.tip3p
+source leaprc.gaff2
+
+# load 2OG parameters 
+loadAmberParams ${COFACTOR_DIR}/${COFACTOR_FRCMOD}
+2OG = loadMol2 ${COFACTOR_DIR}/${COFACTOR_MOL2}
+
+# Load ligand parameters
+loadAmberParams ${param_dir}/UNK.frcmod
+LIG = loadMol2 ${param_dir}/UNK.mol2
+
+complex_solv = loadPdb ${out_dir}/complex_solv_input.pdb
+saveAmberParm complex_solv ${out_dir}/complex_solv.prmtop ${out_dir}/complex_solv.inpcrd
+
+complex_dry = loadPdb ${out_dir}/complex_dry_input.pdb
+saveAmberParm complex_dry ${out_dir}/complex_dry.prmtop ${out_dir}/complex_dry.inpcrd
+
+receptor = loadPdb ${out_dir}/receptor_dry_input.pdb
+saveAmberParm receptor ${out_dir}/receptor_dry.prmtop ${out_dir}/receptor_dry.inpcrd
+
+ligand = loadPdb ${out_dir}/ligand_dry_input.pdb
+saveAmberParm ligand ${out_dir}/ligand_dry.prmtop ${out_dir}/ligand_dry.inpcrd
+quit
+EOF
+
+    echo "  Running tleap..."
+    tleap -f "${out_dir}/build_topology.tleap" > "${out_dir}/tleap.log" 2>&1
+
+    if [[ ! -f "${out_dir}/complex_solv.prmtop" ]]; then
+        echo "  ERROR: tleap failed. See ${out_dir}/tleap.log"
+        tail -20 "${out_dir}/tleap.log"
+        continue
+    fi
+
+    echo "  Applying smart topology patching with ParmEd..."
+    python3 - << PYEOF
+import parmed as pmd
+import os
+
+out_dir = "mmpbsa_results/${name}"
+orig_pdb = "${name}/trajectory_${name}_holo.pdb"
+
+with open(orig_pdb, 'r') as f:
+    orig_lines = [l for l in f if l.startswith("ATOM") or l.startswith("HETATM")]
+target_atoms = len(orig_lines)
+
+has_oxt = any(" OXT " in l for l in orig_lines)
+has_prot_h2 = any(" H2 " in l and "WAT" not in l and "HOH" not in l for l in orig_lines)
+
+prmtops = [f"{out_dir}/complex_solv", f"{out_dir}/complex_dry", f"{out_dir}/receptor_dry"]
+
+for base in prmtops:
+    prmtop = base + ".prmtop"
+    inpcrd = base + ".inpcrd"
+    if not os.path.exists(prmtop): continue
+    
+    parm = pmd.load_file(prmtop, inpcrd)
+    
+    if not has_oxt:
+        parm.strip("@OXT")
+    if not has_prot_h2:
+        parm.strip("@H2,H3 & !:WAT,HOH")
+    
+    for atom in parm.atoms:
+        if atom.name == "H1" and atom.residue.name not in ["WAT", "HOH", "LIG", "2OG", "FE"]:
+            atom.name = "H"
+            
+    parm.save(prmtop, overwrite=True)
+    parm.save(inpcrd, overwrite=True)
+    
+    if "solv" in prmtop:
+        after = len(parm.atoms)
+        if after == target_atoms:
+            print(f"    SUCCESS: prmtop EXACTLY matches DCD ({after} atoms).")
+        else:
+            print(f"    WARNING: prmtop ({after}) != DCD ({target_atoms}). Check diagnostics in log.")
+PYEOF
+
+done
+
+echo "============================================================"
+echo "  Step 02 complete."
