@@ -1,0 +1,81 @@
+import os
+import glob
+import re
+import numpy as np
+import pandas as pd
+
+INPUT_FOLDER = 'input'
+
+OUTPUT_CSV = '02.1_enzyme_energies_2OG.csv'
+
+# Reads sdf GNINA output files and provides minimized affinity 
+def extract_energies_from_sdf(filepath):
+
+    energies = []
+    try:
+        with open(filepath, 'r') as f:
+            content = f.read()
+            
+        matches = re.findall(r"> <minimizedAffinity>\n\s*([-+]?\d*\.\d+|\d+)", content)
+        
+        energies = [float(x) for x in matches]
+        
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}")
+        
+    return energies
+
+def main():
+    print(f"Scanning for docked files in: {INPUT_FOLDER}...")
+    
+    # Find all docked SDF files
+    sdf_files = glob.glob(os.path.join(INPUT_FOLDER, "*", "*_docked.sdf"))
+    
+    if not sdf_files:
+        print("No *_docked.sdf files found! Check your path.")
+        return
+
+    data_records = []
+
+    for sdf_path in sdf_files:
+        # Get the enzyme accession number (filename without _docked.sdf)
+        filename = os.path.basename(sdf_path)
+        enzyme_name = filename.replace("_docked.sdf", "")
+        
+        energies = extract_energies_from_sdf(sdf_path)
+        
+        if energies:
+            mean_energy = np.mean(energies)
+            std_dev = np.std(energies)
+            best_energy = np.min(energies) 
+            num_poses = len(energies)
+            
+            data_records.append({
+                'Enzyme_ID': enzyme_name,
+                'Mean_Energy': mean_energy,
+                'Energy_Error_Margin': std_dev, 
+                'Best_Energy': best_energy,
+                'Num_Poses': num_poses
+            })
+        else:
+            print(f"Warning: No energies found in {filename}")
+
+    # Create a DataFrame and save to CSV
+    if data_records:
+        df = pd.DataFrame(data_records)
+        
+        # Sort candidates in order by best energy at the top 
+        df = df.sort_values(by='Best_Energy', ascending=True)
+        
+        df.to_csv(OUTPUT_CSV, index=False)
+        
+        print("-" * 60)
+        print(f"Processing Complete. Found {len(df)} candidates.")
+        print(f"Results saved to: {os.path.abspath(OUTPUT_CSV)}")
+        print("-" * 60)
+        print(df.head(10)) 
+    else:
+        print("No valid energy data extracted.")
+
+if __name__ == "__main__":
+    main()
