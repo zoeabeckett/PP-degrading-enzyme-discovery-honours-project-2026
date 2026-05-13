@@ -1,0 +1,36 @@
+from scipy.spatial.distance import cdist
+import pandas as pd
+import numpy as np
+
+
+df = pd.read_csv('csv file') 
+
+print(f"\n--- Extracting Central Candidates from {len(df)} points ---")
+
+clean_df = df[df['Cluster_Label'] != -1].copy()
+
+representatives_list = []
+unique_clusters = clean_df['Cluster_Label'].unique()
+
+print(f"Processing {len(unique_clusters)} clusters...")
+
+for cluster_id in unique_clusters:
+    cluster_points = clean_df[clean_df['Cluster_Label'] == cluster_id]
+    
+    coords = cluster_points[['x', 'y']].values
+    
+    centroid = coords.mean(axis=0).reshape(1, -1)
+    
+    distances = cdist(coords, centroid, metric='euclidean')
+    closest_index = distances.argmin()
+    
+    best_candidate = cluster_points.iloc[[closest_index]]
+    representatives_list.append(best_candidate)
+
+final_candidates = pd.concat(representatives_list)
+
+output_filename = 'boltz_candidates.csv'
+final_candidates.to_csv(output_filename, index=False)
+
+print(f"\nSuccess. Extracted {len(final_candidates)} representative candidates.")
+print(f"Saved to '{output_filename}'.")
