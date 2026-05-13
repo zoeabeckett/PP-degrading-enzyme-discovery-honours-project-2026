@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""
+Renames 2OG atom names in PDB to match the mol2 atom names for tleap.
+
+"""
+
+import os
+import sys
+import glob
+import re
+
+CANDIDATE_PATTERN = re.compile(r"candidate_([^_]+)_holo_full_structure\.pdb$", re.IGNORECASE)
+
+RENAME_MAP = {
+    "O7" : "O1A",
+    "O8" : "O2A",
+    "O9" : "O3A",
+    "O10": "O4A",
+    "O11": "O5A",
+    "C12": "C6A",
+    "C13": "C7A",
+    "C14": "C8A",
+    "C15": "C9A",
+    "C16": "C1B",
+}
+
+def format_atom_name(name):
+# Format atom name to fit PDB cols 12-15.
+    if len(name) == 1:
+        return f" {name}  "
+    elif len(name) == 2:
+        return f" {name} "
+    elif len(name) == 3:
+        return f" {name}"
+    else:
+        return f"{name}"
+
+def rename_2og(input_path, output_path, candidate_id):
+    with open(input_path) as f:
+        lines = f.readlines()
+
+    fixed = []
+    renamed = []
+
+    for line in lines:
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            fixed.append(line)
+            continue
+
+        res_name  = line[17:20].strip()
+        atom_name = line[12:16].strip()
+
+        if res_name == "2OG" and atom_name in RENAME_MAP:
+            new_name = RENAME_MAP[atom_name]
+            line = line[:12] + format_atom_name(new_name) + line[16:]
+            renamed.append(f"  {atom_name} -> {new_name}")
+
+        fixed.append(line)
+
+    with open(output_path, 'w') as f:
+        f.writelines(fixed)
+
+    print(f"  [{candidate_id}] {os.path.basename(input_path)} -> {os.path.basename(output_path)}")
+    print(f"    Renamed {len(renamed)} 2OG atoms:")
+    for r in renamed:
+        print(f"    {r}")
+
+    unmapped = set(RENAME_MAP.keys()) - {r.strip().split("->")[0].strip() for r in renamed}
+    if unmapped:
+        print(f"    WARNING: expected atoms not found in PDB: {unmapped}")
+
+
+def main():
+    if len(sys.argv) >= 3:
+        input_dir = sys.argv[1]
+        output_dir = sys.argv[2]
+    elif len(sys.argv) == 2:
+        input_dir = sys.argv[1]
+        output_dir = os.path.join(input_dir, "fixed")
+    else:
+        input_dir = "."
+        output_dir = "./fixed"
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    all_pdb_files = glob.glob(os.path.join(input_dir, "*.pdb"))
+
+    candidate_files = []
+    skipped = []
+    for pdb_file in sorted(all_pdb_files):
+        basename = os.path.basename(pdb_file)
+        match = CANDIDATE_PATTERN.match(basename)
+        if match:
+            candidate_id = match.group(1)
+            candidate_files.append((pdb_file, candidate_id))
+        else:
+            skipped.append(basename)
+
+    if skipped:
+        print(f"Skipped {len(skipped)} file(s) not matching 'candidate_<ID>_holo_full_structure.pdb':")
+        for s in skipped:
+            print(f"  - {s}")
+        print()
+
+    if not candidate_files:
+        print(f"No matching candidate PDB files found in {input_dir}")
+        print("Expected pattern: candidate_<ID>_holo_full_structure.pdb")
+        sys.exit(1)
+
+    print(f"Found {len(candidate_files)} candidate PDB file(s) in {input_dir}")
+    print(f"Writing fixed files to {output_dir}\n")
+
+    for pdb_file, candidate_id in candidate_files:
+        basename = os.path.basename(pdb_file)
+        output_file = os.path.join(output_dir, basename)
+        rename_2og(pdb_file, output_file, candidate_id)
+
+    print(f"\nDone. {len(candidate_files)} candidate file(s) processed.")
+
+
+if __name__ == "__main__":
+    main()
