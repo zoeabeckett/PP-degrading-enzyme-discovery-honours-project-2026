@@ -1,0 +1,48 @@
+import subprocess
+import os
+import sys
+
+def run_mmseqs_clustering(input_fasta, output_prefix, min_id=0.3, coverage=0.8):
+    """
+    Runs MMseqs2 easy-cluster to reduce sequence redundancy
+    """
+    
+    
+    tmp_dir = "tmp_mmseqs"
+    if not os.path.exists(tmp_dir):
+        os.makedirs(tmp_dir)
+
+   
+   
+    cmd = [
+        "mmseqs", "easy-cluster",
+        input_fasta,
+        output_prefix,
+        tmp_dir,
+        "--min-seq-id", str(min_id),
+        "-c", str(coverage),
+        "--cov-mode", "0"  
+    ]
+
+    print(f"--- Starting MMseqs2 Clustering at {min_id*100}% Identity ---")
+    print(f"Command: {' '.join(cmd)}")
+
+    try:
+        subprocess.run(cmd, check=True)
+        
+        print("\n--- Clustering Complete! ---")
+        print(f"Representative sequences: {output_prefix}_rep_seq.fasta")
+        print(f"Cluster assignments: {output_prefix}_cluster.tsv")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error occurred while running MMseqs2: {e}")
+    except FileNotFoundError:
+        print("Error: 'mmseqs' command not found. Did you run 'conda install -c bioconda mmseqs2'?")
+    finally:
+        pass
+
+if __name__ == "__main__":
+    input_file = "cdhit_clustered"
+    output_name = "02.1_mmseq_clustered1"
+    
+    run_mmseqs_clustering(input_file, output_name)
