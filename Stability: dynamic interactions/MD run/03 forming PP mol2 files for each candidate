@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+Creates a UNK.mol2 file for each candidate by:
+  1. Extracting UNK heavy atoms from the candidate's PDB (now properly named e.g. C1A, C2A...)
+  2. Adding hydrogens with obabel
+  3. Writing a new mol2 using candidate D's template (charges, bonds, atom types)
+     but with each candidate's own coordinates #based on first candidate MD run (additional pre drMD input steps) 
+"""
+
+import os
+import sys
+import glob
+import subprocess
+import shutil
+
+
+CANDIDATES_DIR  = "/home/s_zoe/T_2OG_MD/2OG_holo_MD/2OG_MD_fixed_holo_structures"
+OUTPUT_BASE     = "/home/s_zoe/T_2OG_MD/2OG_holo_MD/03_outputs_UNKs_2OG"
+TEMPLATE_MOL2   = "/home/s_zoe/T_2OG_MD/2OG_holo_MD/02_output_drMD/candidate_BB_holo_full_structure/00_prep/UNK/UNK.mol2"
+TEMPLATE_FRCMOD = "/home/s_zoe/T_2OG_MD/2OG_holo_MD/02_output_drMD/candidate_BB_holo_full_structure/00_prep/UNK/UNK.frcmod"
+
+
+
+def parse_mol2_atoms(mol2_path):
+# Parse all atoms from mol2 file
+    atoms = []
+    in_atom_section = False
+    with open(mol2_path) as f:
+        for line in f:
+            if line.strip() == "@<TRIPOS>ATOM":
+                in_atom_section = True
+                continue
+            if line.startswith("@<TRIPOS>") and in_atom_section:
+                break
+            if in_atom_section and line.strip():
+                parts = line.split()
+                atoms.append({
+                    "idx":     parts[0],
+                    "name":    parts[1],
+                    "x":       float(parts[2]),
+                    "y":       float(parts[3]),
+                    "z":       float(parts[4]),
+                    "type":    parts[5],
+                    "resnum":  parts[6],
+                    "resname": parts[7],
+                    "charge":  parts[8] if len(parts) > 8 else "0.0",
+                    "extra":   parts[9] if len(parts) > 9 else ""
+                })
+    return atoms
+
+
+def read_mol2_sections(mol2_path):
+# Read all mol2 sections preserving order
+    sections = {}
+    section_order = []
+    current_section = None
+    current_lines = []
+    with open(mol2_path) as f:
+        for line in f:
+            if line.startswith("@<TRIPOS>"):
+                if current_section:
+                    sections[current_section] = current_lines
+                current_section = line.strip()
+                section_order.append(current_section)
+                current_lines = []
+            else:
+                current_lines.append(line)
+        if current_section:
+            sections[current_section] = current_lines
+    return sections, section_order
+
+
+def extract_unk_pdb(pdb_path, output_path):
+# Extract UNK atoms from PDB into a separate file
+    with open(pdb_path) as f:
+        lines = f.readlines()
+    unk_lines = [l for l in lines
+                 if (l.startswith("ATOM") or l.startswith("HETATM"))
+                 and l[17:20].strip() == "UNK"]
+    with open(output_path, 'w') as f:
+        f.writelines(unk_lines)
+        f.write("END\n")
+    return len(unk_lines)
+
+
+def add_hydrogens_obabel(input_pdb, output_pdb):
+# Add hydrogens using obabel
+    result = subprocess.run(
+        ["obabel", input_pdb, "-O", output_pdb, "-h", "--unique"],
+        capture_output=True, text=True
+    )
+    return os.path.exists(output_pdb) and os.path.getsize(output_pdb) > 0
+
+
+def parse_coords_from_pdb(pdb_path):
+    """Parse all atom coordinates from PDB, return dict {atom_name: (x,y,z)}."""
+    coords = {}
+    with open(pdb_path) as f:
+        for line in f:
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                atom_name = line[12:16].strip()
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords[atom_name] = (x, y, z)
+                except ValueError:
+                    continue
+    return coords
+
+
+def write_mol2_with_new_coords(template_mol2, heavy_coords, h_coords, output_mol2):
+
+    sections, section_order = read_mol2_sections(template_mol2)
+    template_atoms = parse_mol2_atoms(template_mol2)
+
+    new_atom_lines = []
+    unmatched_heavy = []
+    unmatched_h = []
+
+    for atom in template_atoms:
+        name = atom["name"]
+        is_hydrogen = atom["type"].startswith("h") or name.startswith("H")
+
+        if not is_hydrogen:
+            if name in heavy_coords:
+                x, y, z = heavy_coords[name]
+            else:
+                x, y, z = atom["x"], atom["y"], atom["z"]
+                unmatched_heavy.append(name)
+        else:
+            if name in h_coords:
+                x, y, z = h_coords[name]
+            else:
+                # H coords not critical - tleap will rebuild if needed
+                x, y, z = atom["x"], atom["y"], atom["z"]
+                unmatched_h.append(name)
+
+        extra = f" {atom['extra']}" if atom['extra'] else ""
+        line = (f"{atom['idx']:>6} {name:<8} {x:>10.4f} {y:>10.4f} {z:>10.4f} "
+                f"{atom['type']:<6} {atom['resnum']:>3} {atom['resname']:<8} "
+                f"{atom['charge']:>10}{extra}\n")
+        new_atom_lines.append(line)
+
+    if unmatched_heavy:
+        print(f"  WARNING: {len(unmatched_heavy)} heavy atoms used template coords: {unmatched_heavy}")
+    if unmatched_h:
+        print(f"  Note: {len(unmatched_h)} H atoms used template coords (OK - tleap will rebuild)")
+
+    with open(output_mol2, 'w') as f:
+        for section_name in section_order:
+            f.write(f"{section_name}\n")
+            if section_name == "@<TRIPOS>ATOM":
+                f.writelines(new_atom_lines)
+            else:
+                f.writelines(sections[section_name])
+
+    return len(unmatched_heavy)
+
+
+def main():
+    # Check template files exist
+    for path in [TEMPLATE_MOL2, TEMPLATE_FRCMOD]:
+        if not os.path.exists(path):
+            print(f"ERROR: Template file not found: {path}")
+            sys.exit(1)
+
+    template_atoms = parse_mol2_atoms(TEMPLATE_MOL2)
+    heavy_names = [a["name"] for a in template_atoms if not a["type"].startswith("h")]
+    h_names     = [a["name"] for a in template_atoms if a["type"].startswith("h")]
+    print(f"Template: {len(heavy_names)} heavy atoms, {len(h_names)} hydrogens")
+    print(f"Template mol2:   {TEMPLATE_MOL2}")
+    print(f"Template frcmod: {TEMPLATE_FRCMOD}\n")
+
+    pdb_files = sorted(glob.glob(os.path.join(CANDIDATES_DIR, "*.pdb")))
+    print(f"Found {len(pdb_files)} candidate PDB files\n")
+
+    success = 0
+    failed = []
+
+    for pdb_file in pdb_files:
+        basename = os.path.basename(pdb_file).replace(".pdb", "")
+        print(f"--- {basename} ---")
+
+        unk_dir = os.path.join(OUTPUT_BASE, basename, "00_prep", "UNK")
+        os.makedirs(unk_dir, exist_ok=True)
+
+        unk_pdb       = os.path.join(unk_dir, "UNK.pdb")
+        unk_pdb_h     = os.path.join(unk_dir, "UNK_H.pdb")
+        output_mol2   = os.path.join(unk_dir, "UNK.mol2")
+        output_frcmod = os.path.join(unk_dir, "UNK.frcmod")
+
+        # Skip if already done
+        if os.path.exists(output_mol2) and os.path.exists(output_frcmod):
+            print(f"  Already exists - skipping")
+            success += 1
+            continue
+
+        # Extract UNK heavy atoms from PDB
+        n_heavy = extract_unk_pdb(pdb_file, unk_pdb)
+        print(f"  Extracted {n_heavy} UNK heavy atoms")
+
+        if n_heavy == 0:
+            print(f"  ERROR: no UNK atoms found")
+            failed.append(f"{basename} (no UNK found)")
+            continue
+
+        # Add hydrogens
+        print(f"  Adding hydrogens with obabel...")
+        if not add_hydrogens_obabel(unk_pdb, unk_pdb_h):
+            print(f"  ERROR: obabel failed")
+            failed.append(f"{basename} (obabel failed)")
+            continue
+
+        # Parse coords --> heavy from original PDB, H from obabel output
+        heavy_coords = parse_coords_from_pdb(unk_pdb)
+        all_coords   = parse_coords_from_pdb(unk_pdb_h)
+        h_coords     = {k: v for k, v in all_coords.items() if k not in heavy_coords}
+
+        print(f"  Heavy: {len(heavy_coords)}, H: {len(h_coords)}")
+
+        # Write mol2
+        n_unmatched = write_mol2_with_new_coords(
+            TEMPLATE_MOL2, heavy_coords, h_coords, output_mol2
+        )
+
+        # Copy frcmod from template
+        shutil.copy(TEMPLATE_FRCMOD, output_frcmod)
+
+        if n_unmatched == 0:
+            print(f"  SUCCESS")
+        else:
+            print(f"  SUCCESS with warnings - {n_unmatched} heavy atoms used template coords")
+        success += 1
+
+    print(f"\n{'='*50}")
+    print(f"SUMMARY: {success} succeeded, {len(failed)} failed")
+    if failed:
+        for f in failed:
+            print(f"  - {f}")
+    print(f"\nNext step: run prep_all_candidates.sh")
+
+
+if __name__ == "__main__":
+    main()
