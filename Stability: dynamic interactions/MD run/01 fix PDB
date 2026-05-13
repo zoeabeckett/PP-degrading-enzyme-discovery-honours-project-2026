@@ -1,0 +1,100 @@
+# Fix PDB created in PyMOL after GNINA molecular docking. This MD run is explaining the creation of the holo state, also do this for apo. 
+#!/usr/bin/env python3
+"""
+Fix PDB files for drMD compatibility:
+
+  1. Assign chain ID 'C' to UNK residues (currently missing chain ID)
+     and fix residue number from 0 to 1.
+
+"""
+
+import os
+import sys
+import glob
+import re
+
+
+CANDIDATE_PATTERN = re.compile(r"candidate_([^_]+)_holo_full_structure\.pdb$", re.IGNORECASE)
+
+
+def fix_pdb(input_path, output_path, candidate_id):
+    with open(input_path, 'r') as f:
+        lines = f.readlines()
+
+    fixed_lines = []
+    for line in lines:
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            fixed_lines.append(line)
+            continue
+
+        res_name = line[17:20].strip()
+        chain_id = line[21]
+
+        # Assign chain C to UNK residues with missing chain ID
+        # and fix residue number 0 -> 1
+        if res_name == "UNK" and chain_id == " ":
+            line = line[:21] + "C" + line[22:]
+            res_num = line[22:26].strip()
+            if res_num == "0":
+                line = line[:22] + "   1" + line[26:]
+
+
+        fixed_lines.append(line)
+
+    with open(output_path, 'w') as f:
+        f.writelines(fixed_lines)
+
+    print(f"  [{candidate_id}] {os.path.basename(input_path)} -> {os.path.basename(output_path)}")
+
+
+def main():
+    if len(sys.argv) >= 3:
+        input_dir = sys.argv[1]
+        output_dir = sys.argv[2]
+    elif len(sys.argv) == 2:
+        input_dir = sys.argv[1]
+        output_dir = os.path.join(input_dir, "fixed")
+    else:
+        input_dir = "."
+        output_dir = "./fixed"
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    all_pdb_files = glob.glob(os.path.join(input_dir, "*.pdb"))
+
+    candidate_files = []
+    skipped = []
+    for pdb_file in sorted(all_pdb_files):
+        basename = os.path.basename(pdb_file)
+        match = CANDIDATE_PATTERN.match(basename)
+        if match:
+            candidate_id = match.group(1)
+            candidate_files.append((pdb_file, candidate_id))
+        else:
+            skipped.append(basename)
+
+    if skipped:
+        print(f"Skipped {len(skipped)} file(s) not matching 'candidate_<ID>_holo_full_structure.pdb':")
+        for s in skipped:
+            print(f"  - {s}")
+        print()
+
+    if not candidate_files:
+        print(f"No matching candidate PDB files found in {input_dir}")
+        print("Expected pattern: candidate_<ID>_holo_full_structure.pdb")
+        sys.exit(1)
+
+    print(f"Found {len(candidate_files)} candidate PDB file(s) in {input_dir}")
+    print(f"Writing fixed files to {output_dir}\n")
+
+    for pdb_file, candidate_id in candidate_files:
+        basename = os.path.basename(pdb_file)
+        output_file = os.path.join(output_dir, basename)
+        fix_pdb(pdb_file, output_file, candidate_id)
+
+    print(f"\nDone. {len(candidate_files)} candidate file(s) fixed.")
+    print("\nNext steps:")
+
+
+if __name__ == "__main__":
+    main()
