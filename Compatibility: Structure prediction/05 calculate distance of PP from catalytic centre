@@ -1,0 +1,199 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+from Bio import PDB
+import warnings
+ 
+LIGAND_FOLDER   = 'ligand input file'
+RECEPTOR_FOLDER = 'receptor input file'
+OUTPUT_CSV      = '/home/s_zoe/T_GNINA_2OG/03.1_enzyme_distances.csv'
+ 
+warnings.simplefilter('ignore', PDB.PDBExceptions.PDBConstructionWarning)
+ 
+ 
+def get_iron_coords(receptor_path):
+    parser = PDB.PDBParser(QUIET=True)
+    try:
+        structure = parser.get_structure('receptor', receptor_path)
+        for atom in structure.get_atoms():
+            elem = (getattr(atom, 'element', '') or '').strip().upper()
+            name = atom.name.strip().upper()
+            if elem == 'FE' or name in ('FE', 'FE1', 'FE2'):
+                coords = atom.get_coord()
+                print(f"    Fe found: ({coords[0]:.3f}, {coords[1]:.3f}, {coords[2]:.3f})")
+                return coords
+    except Exception as e:
+        print(f"  [Error] Reading receptor {os.path.basename(receptor_path)}: {e}")
+    return None
+ 
+ 
+def find_receptor(accession, receptor_folder):
+
+    acc_dir = os.path.join(receptor_folder, accession)
+ 
+    candidates = [
+        os.path.join(acc_dir, f"{accession}_model_0_receptor_gnina.pdb"),
+        os.path.join(acc_dir, f"{accession}_model_0_receptor.pdb"),
+        os.path.join(receptor_folder, f"{accession}_receptor_gnina.pdb"),
+        os.path.join(receptor_folder, f"{accession}_receptor.pdb"),
+    ]
+ 
+    for path in candidates:
+        if os.path.exists(path):
+            print(f"    Receptor: {os.path.basename(path)}")
+            return path
+    return None
+ 
+ 
+def parse_multimodel_pdb_direct(pdb_path):
+
+    poses           = {}
+    current_pose    = None
+    current_carbons = []
+ 
+    with open(pdb_path, 'r') as f:
+        for line in f:
+            record = line[:6].strip()
+ 
+            if record == 'MODEL':
+                try:
+                    current_pose = int(line.split()[1])
+                except (IndexError, ValueError):
+                    current_pose = len(poses) + 1
+                current_carbons = []
+ 
+            elif record == 'ENDMDL':
+                if current_pose is not None and current_carbons:
+                    poses[current_pose] = current_carbons
+                current_pose    = None
+                current_carbons = []
+ 
+            elif record in ('ATOM', 'HETATM'):
+                if current_pose is None:
+                    continue
+                element   = line[76:78].strip().upper() if len(line) > 76 else ''
+                atom_name = line[12:16].strip().upper()
+                is_carbon = (element == 'C' or
+                             (not element and atom_name.startswith('C')))
+                if is_carbon:
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                        current_carbons.append(np.array([x, y, z]))
+                    except ValueError:
+                        continue
+ 
+    if not poses and current_carbons:
+        poses[1] = current_carbons
+ 
+    return poses
+ 
+ 
+def calculate_distances(poses, fe_coords):
+    fe      = np.array(fe_coords)
+    results = []
+    for pose_id in sorted(poses.keys()):
+        carbons = poses[pose_id]
+        if not carbons:
+            continue
+        distances = [float(np.linalg.norm(c - fe)) for c in carbons]
+        results.append({
+            'Pose_ID':       pose_id,
+            'N_Carbons':     len(distances),
+            'Avg_Dist_C_Fe': float(np.mean(distances)),
+            'Min_Dist_C_Fe': float(np.min(distances)),
+            'N_C_within_5A': sum(1 for d in distances if d <= 5.0),
+            'N_C_within_4A': sum(1 for d in distances if d <= 4.0),
+        })
+    return results
+ 
+ 
+def main():
+    print("Fe-PP Distance Calculations")
+    print(f"Ligand folder  : {LIGAND_FOLDER}")
+    print(f"Receptor folder: {RECEPTOR_FOLDER}\n")
+ 
+    ligand_files = sorted(glob.glob(
+        os.path.join(LIGAND_FOLDER, "*_docked.pdb")))
+ 
+    if not ligand_files:
+        print(f"No *_docked.pdb files found under {LIGAND_FOLDER}")
+        return
+ 
+    print(f"Found {len(ligand_files)} docked ligand PDB(s)\n")
+ 
+    all_data = []
+    skipped  = []
+ 
+    for ligand_path in ligand_files:
+        filename  = os.path.basename(ligand_path)
+        accession = filename.replace("_model_0_docked.pdb", "")
+ 
+        print(f"Processing: {accession}")
+ 
+        receptor_path = find_receptor(accession, RECEPTOR_FOLDER)
+        if receptor_path is None:
+            print(f"  No receptor found")
+            skipped.append(accession)
+            continue
+ 
+        fe_coords = get_iron_coords(receptor_path)
+        if fe_coords is None:
+            print(f"  No Fe atom found in receptor")
+            skipped.append(accession)
+            continue
+ 
+        poses = parse_multimodel_pdb_direct(ligand_path)
+        print(f"    Poses read: {len(poses)}")
+ 
+        if not poses:
+            print(f"  No poses found in ligand PDB")
+            skipped.append(accession)
+            continue
+ 
+        dist_data = calculate_distances(poses, fe_coords)
+ 
+        for record in dist_data:
+            record['Enzyme_ID'] = accession
+            all_data.append(record)
+ 
+        best = min(dist_data, key=lambda x: x['Min_Dist_C_Fe'])
+        print(f"    Best pose #{best['Pose_ID']}  |  "
+              f"Min Fe-C: {best['Min_Dist_C_Fe']:.2f} A  |  "
+              f"C within 5A: {best['N_C_within_5A']}")
+ 
+    print(f"\n{'='*55}")
+    if not all_data:
+        print("No distance data calculated.")
+        return
+ 
+    df = pd.DataFrame(all_data)
+    df = df[['Enzyme_ID', 'Pose_ID', 'N_Carbons',
+             'Avg_Dist_C_Fe', 'Min_Dist_C_Fe',
+             'N_C_within_5A', 'N_C_within_4A']]
+ 
+    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"Results saved : {OUTPUT_CSV}")
+    print(f"Total rows    : {len(df)}")
+ 
+    print(f"\nBest pose per enzyme:")
+    print(f"{'Enzyme':<45} {'Min Fe-C':>10}  {'Pose':>5}  {'C<=5A':>6}")
+    print("-" * 72)
+    for enz in df['Enzyme_ID'].unique():
+        sub  = df[df['Enzyme_ID'] == enz]
+        best = sub.loc[sub['Min_Dist_C_Fe'].idxmin()]
+        flag = " *" if best['Min_Dist_C_Fe'] <= 5.0 else ""
+        print(f"  {enz[:43]:<43} "
+              f"{best['Min_Dist_C_Fe']:>8.2f}  "
+              f"{int(best['Pose_ID']):>5}  "
+              f"{int(best['N_C_within_5A']):>6}{flag}")
+ 
+    if skipped:
+        print(f"Skipped ({len(skipped)}): {', '.join(skipped)}")
+ 
+ 
+if __name__ == "__main__":
+    main()
