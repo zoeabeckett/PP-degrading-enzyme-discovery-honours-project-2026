@@ -1,0 +1,64 @@
+#!/bin/bash
+
+
+set -euo pipefail
+
+CANDIDATES=("positive_control")
+if [[ $# -gt 0 ]]; then CANDIDATES=("$@"); fi
+
+
+echo "  Step 4: Run MMPBSA.py (Non-Heme System)"
+
+
+for name in "${CANDIDATES[@]}"; do
+    out_dir="mmpbsa_results/${name}"
+
+    echo "  Processing: ${name}"
+    
+    # Clean up candidates 
+    echo "  Cleaning up old temporary files..."
+    rm -f _MMPBSA_* 
+    rm -f "${out_dir}/mmpbsa.log"
+    rm -f "${out_dir}/FINAL_RESULTS_MMPBSA.dat"
+
+    # Create compatible mmpbsa.in file 
+    cat > mmpbsa.in << EOF
+Input file for running PB and GB
+&general
+   verbose=1,
+   keep_files=0,
+/
+&gb
+   igb=5, 
+   saltcon=0.150,
+/
+&pb
+   istrng=0.150,
+   # fillratio=2.0 prevents memory/grid crash
+   fillratio=2.0,
+   radiopt=0,
+/
+EOF
+
+    # Run MMPBSA
+    MMPBSA.py \
+        -O \
+        -i  "mmpbsa.in" \
+        -o  "${out_dir}/FINAL_RESULTS_MMPBSA.dat" \
+        -cp "${out_dir}/complex_dry.prmtop" \
+        -rp "${out_dir}/receptor_dry.prmtop" \
+        -lp "${out_dir}/ligand_dry.prmtop" \
+        -y  "${out_dir}/traj_stripped.nc" \
+        > "${out_dir}/mmpbsa.log" 2>&1
+
+    if [[ -f "${out_dir}/FINAL_RESULTS_MMPBSA.dat" ]]; then
+        echo "  SUCCESS: Results saved to ${out_dir}/FINAL_RESULTS_MMPBSA.dat"
+    else
+        echo "  ERROR: MMPBSA.py failed. Checking log for errors..."
+        if grep -q "Radius not found" "${out_dir}/mmpbsa.log" || grep -q "Radius not found" _MMPBSA_*pb.out 2>/dev/null; then
+             echo "  CRITICAL ERROR: Radius not found for Iron (FE)."
+        else
+             tail -n 5 "${out_dir}/mmpbsa.log"
+        fi
+    fi
+done
