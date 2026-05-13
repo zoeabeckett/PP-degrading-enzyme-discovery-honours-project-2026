@@ -1,0 +1,43 @@
+import pandas as pd
+
+# Load data 
+try:
+    df_energies = pd.read_csv('input energy file')
+    df_energies['Enzyme_ID'] = df_energies['Enzyme_ID'].str.replace('_model_0', '', regex=False)
+    df_distances = pd.read_csv('input distance csv table')
+except FileNotFoundError as e:
+    print(f"Error loading files: {e}")
+    exit()
+
+# Data processing 
+df_dist_agg = df_distances.groupby('Enzyme_ID')['Mean_MinDist_Fe'].mean().reset_index()
+merged_df = pd.merge(df_energies, df_dist_agg, on='Enzyme_ID', how='inner')
+
+# Filter candidates 
+candidates = merged_df[
+    (merged_df['Mean_MinDist_Fe'] < 5.0) & 
+    (merged_df['Mean_Energy'] < -5.0)
+].copy() 
+
+
+# Sort by Mean min distance with shortest distance first 
+
+candidates = candidates.sort_values(
+    by=['Mean_MinDist_Fe', 'Mean_Energy'], 
+    ascending=[True, True]
+)
+
+num_found = len(candidates)
+
+print(f"Found {num_found} candidates matching criteria.")
+
+
+if num_found == 0:
+    print("No candidates found. Try relaxing the cutoffs (e.g., < 12A or < -3.0).")
+    exit()
+
+# Save
+
+output_csv = "05.1_best_candidates_min_dist_5.csv"
+candidates[['Enzyme_ID', 'Mean_Energy', 'Mean_MinDist_Fe']].to_csv(output_csv, index=False)
+print(f"List saved to: {output_csv}\n")
