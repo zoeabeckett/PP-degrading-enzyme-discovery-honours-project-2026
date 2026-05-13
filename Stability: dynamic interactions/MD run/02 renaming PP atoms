@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""
+Sequentially renames generic UNK heavy atoms (all named 'C') in candidate
+PDB files to proper AMBER names (C1A, C2A ... C9C) based on atom order.
+"""
+
+import os
+import sys
+import glob
+
+# Template atom name order - matches mol2 files order exactly
+ATOM_NAME_ORDER = [
+    "C1A", "C2A", "C3A", "C4A", "C5A", "C6A", "C7A", "C8A", "C9A",
+    "C1B", "C2B", "C3B", "C4B", "C5B", "C6B",
+    "C7B", "C8B", "C9B", "C1C", "C2C", "C3C", "C4C", "C5C", "C6C",
+    "C7C", "C8C", "C9C"
+]
+
+
+def needs_renaming(pdb_path):
+    names = set()
+    with open(pdb_path) as f:
+        for line in f:
+            if (line.startswith("ATOM") or line.startswith("HETATM")) and \
+               line[17:20].strip() == "UNK":
+                atom = line[12:16].strip()
+                if not atom.startswith("H"):
+                    names.add(atom)
+    return len(names) <= 3
+
+
+def rename_unk(pdb_path):
+    with open(pdb_path) as f:
+        lines = f.readlines()
+
+    new_lines = []
+    name_idx = 0
+
+    for line in lines:
+        if (line.startswith("ATOM") or line.startswith("HETATM")) and \
+           line[17:20].strip() == "UNK":
+            atom = line[12:16].strip()
+            if not atom.startswith("H"):
+                if name_idx >= len(ATOM_NAME_ORDER):
+                    print(f"  WARNING: more UNK heavy atoms than expected ({name_idx+1})")
+                    new_lines.append(line)
+                    continue
+                new_name = ATOM_NAME_ORDER[name_idx]
+                formatted = f" {new_name:<3}" if len(new_name) < 4 else f"{new_name:<4}"
+                line = line[:12] + formatted + line[16:]
+                name_idx += 1
+
+        new_lines.append(line)
+
+    if name_idx != len(ATOM_NAME_ORDER):
+        print(f"  WARNING: expected {len(ATOM_NAME_ORDER)} atoms, renamed {name_idx}")
+
+    return new_lines, name_idx
+
+
+def main():
+    pdb_files = sorted(glob.glob(os.path.join(CANDIDATES_DIR, "*.pdb")))
+    print(f"Found {len(pdb_files)} candidate PDB files\n")
+
+    skipped = 0
+    renamed = 0
+    failed = []
+
+    for pdb_file in pdb_files:
+        basename = os.path.basename(pdb_file)
+        print(f"{basename}")
+
+        if not needs_renaming(pdb_file):
+            print(f"  Already correctly named - skipping")
+            skipped += 1
+            continue
+
+        new_lines, n = rename_unk(pdb_file)
+
+        if n == 0:
+            print(f"  ERROR: no UNK atoms found")
+            failed.append(basename)
+            continue
+
+        tmp = pdb_file + ".tmp"
+        with open(tmp, 'w') as f:
+            f.writelines(new_lines)
+        os.replace(tmp, pdb_file)
+
+        print(f"  SUCCESS - renamed {n} atoms")
+        renamed += 1
+
+    print(f"\n{'='*50}")
+    print(f"SUMMARY")
+    print(f"  Already correct: {skipped}")
+    print(f"  Renamed:         {renamed}")
+    print(f"  Failed:          {len(failed)}")
+    if failed:
+        for f in failed:
+            print(f"    - {f}")
+
+
+
+if __name__ == "__main__":
+    main()
