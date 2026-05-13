@@ -1,0 +1,59 @@
+# run in Linux. Aim is to create solvated systems that are compatible with the AMBER force field 
+#!/bin/bash
+
+BASE=/home/s_zoe/T_2OG_MD/2OG_holo_MD
+
+for PDB in /home/s_zoe/T_2OG_MD/2OG_holo_MD/2OG_MD_renamed_holo_structures_and_FE/candidate_*_holo_full_structure.pdb; do
+    CANDIDATE=$(basename ${PDB} _holo_full_structure.pdb)   # e.g. "candidate_AA"
+
+    echo "Processing ${CANDIDATE}..."
+
+    MOL2_2OG=${BASE}/03_outputs_2OG/${CANDIDATE}_holo_full_structure/00_prep/2OG/2OG.mol2
+    FRCMOD_2OG=${BASE}/03_outputs_2OG/${CANDIDATE}_holo_full_structure/00_prep/2OG/2OG.frcmod
+    MOL2_UNK=${BASE}/03_outputs_UNKs_2OG/${CANDIDATE}_holo_full_structure/00_prep/UNK/UNK.mol2
+    FRCMOD_UNK=${BASE}/03_outputs_UNKs_2OG/${CANDIDATE}_holo_full_structure/00_prep/UNK/UNK.frcmod
+
+    MISSING=0
+    for F in "$MOL2_2OG" "$FRCMOD_2OG" "$MOL2_UNK" "$FRCMOD_UNK"; do
+        if [ ! -f "$F" ]; then
+            echo "  WARNING: missing $F"
+            MISSING=1
+        fi
+    done
+    if [ "$MISSING" -eq 1 ]; then
+        echo "  Skipping ${CANDIDATE} due to missing files."
+        continue
+    fi
+
+    mkdir -p ${BASE}/04_manual_tleap/${CANDIDATE}
+
+    cat > ${BASE}/04_manual_tleap/${CANDIDATE}/tleap.in << EOF
+source leaprc.protein.ff19SB
+source leaprc.gaff2
+source leaprc.water.tip3p
+
+loadamberparams frcmod.ions1lm_126_tip3p
+loadamberparams frcmod.ions234lm_126_tip3p
+
+addAtomTypes {
+    { "fe" "Fe" "sp3" }
+}
+
+2OG = loadmol2 ${MOL2_2OG}
+loadamberparams ${FRCMOD_2OG}
+
+UNK = loadmol2 ${MOL2_UNK}
+loadamberparams ${FRCMOD_UNK}
+
+mol = loadpdb ${PDB}
+
+savepdb mol ${BASE}/04_manual_tleap/${CANDIDATE}/${CANDIDATE}_solvated.pdb
+quit
+EOF
+
+    cd ${BASE}/04_manual_tleap/${CANDIDATE}/
+    tleap -f tleap.in > tleap.out 2>&1
+    echo "--- ${CANDIDATE} tleap output ---"
+    tail -20 tleap.out
+
+done
