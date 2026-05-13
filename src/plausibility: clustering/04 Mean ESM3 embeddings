@@ -1,0 +1,43 @@
+import os
+import torch
+import numpy as np
+from tqdm import tqdm
+
+input_folder = "X"  
+output_matrix = "05_protein_embeddings_matrix.npy"
+output_labels = "05_protein_labels.npy"
+
+files = [f for f in os.listdir(input_folder) if f.endswith(".pt")]
+print(f"Found {len(files)} embedding files.")
+
+all_vectors = []
+all_labels = []
+
+print("Aggregating embeddings...")
+for filename in tqdm(files):
+    path = os.path.join(input_folder, filename)
+    
+    try:
+        data = torch.load(path, weights_only=True)
+        
+        vector = data["mean_embedding"].cpu().numpy()
+        label = data["label"]
+        
+        all_vectors.append(vector)
+        all_labels.append(label)
+        
+    except Exception as e:
+        print(f"Skipping {filename}: {e}")
+
+--
+# Convert list of vectors into one big 2D Matrix (N_proteins x N_dimensions)
+X = np.vstack(all_vectors)
+y = np.array(all_labels)
+
+print(f"\nFinal Matrix Shape: {X.shape}")
+print(f" Saving to {output_matrix}...")
+
+np.save(output_matrix, X)
+np.save(output_labels, y)
+
+print("Done")
