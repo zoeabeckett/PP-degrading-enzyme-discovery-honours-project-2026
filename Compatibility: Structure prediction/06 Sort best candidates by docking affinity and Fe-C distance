@@ -15,7 +15,7 @@ merged_df = pd.merge(df_energies, df_dist_agg, on='Enzyme_ID', how='inner')
 
 # Filter candidates 
 candidates = merged_df[
-    (merged_df['Mean_MinDist_Fe'] < 5.0) & 
+    (merged_df['Mean_MinDist_Fe'] < 8.0) & 
     (merged_df['Mean_Energy'] < -5.0)
 ].copy() 
 
