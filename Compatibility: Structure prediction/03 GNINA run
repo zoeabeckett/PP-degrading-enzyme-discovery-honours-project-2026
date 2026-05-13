@@ -1,0 +1,228 @@
+"""
+Runs GNINA docking for all 2OG candidate receptor/autobox pairs.
+
+Run in terminal:
+    python run_gnina_docking_batch_2OG.py \\
+        --work_dir   /path/to/gnina_ready_candidates/ \\
+        --output_dir /path/to/gnina_results/ \\
+        --ligand     /path/to/clean_PP9.sdf \\
+        --cpus       5
+"""
+
+import argparse
+import subprocess
+import sys
+import os
+from pathlib import Path
+from datetime import datetime
+
+
+def timestamp():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def log(msg, logf=None):
+    """Print to stdout and mirror to summary log file."""
+    print(msg)
+    if logf:
+        logf.write(msg + "\n")
+        logf.flush()
+
+
+def run_gnina(receptor, ligand, autobox, output_sdf, cpus):
+    cmd = [
+        "gnina",
+        "-r",               str(receptor),
+        "-l",               str(ligand),
+        "--autobox_ligand", str(autobox),
+        "--autobox_add",    "10",
+        "-o",               str(output_sdf),
+        "--no_gpu",
+        "--seed",           "0",
+        "--cpu",            str(cpus),
+        "--num_modes",      "9",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode, result.stdout, result.stderr
+
+
+def find_pairs(work_dir):
+
+    pairs   = []
+    missing = []
+
+    for acc_dir in sorted(work_dir.iterdir()):
+        if not acc_dir.is_dir():
+            continue
+        accession = acc_dir.name
+
+        autobox_files = sorted(acc_dir.glob("*_autobox_ligand.pdb"))
+        if not autobox_files:
+            continue
+
+        for autobox in autobox_files:
+            base_id  = autobox.name.replace("_autobox_ligand.pdb", "")
+            receptor = acc_dir / f"{base_id}_receptor_gnina.pdb"
+
+            if not receptor.exists():
+                # Fallback naming without _gnina suffix
+                receptor = acc_dir / f"{base_id}_receptor.pdb"
+
+            if not receptor.exists():
+                missing.append(f"{accession}/{base_id}")
+                continue
+
+            pairs.append({
+                "accession": accession,
+                "base_id":   base_id,
+                "receptor":  receptor,
+                "autobox":   autobox,
+            })
+
+    return pairs, missing
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Batch GNINA docking for 2OG candidate enzymes"
+    )
+    parser.add_argument("--work_dir",   "-w", required=True,
+        help="Folder of accession subfolders from boltz_to_gnina_batch_2OG.py")
+    parser.add_argument("--output_dir", "-o", required=True,
+        help="Folder to write docking results into (subfolders created per accession)")
+    parser.add_argument("--ligand",     "-l", required=True,
+        help="Path to clean PP ligand SDF file")
+    parser.add_argument("--cpus",       "-c", type=int, default=16,
+        help="CPU threads for GNINA (default: 16)")
+    args = parser.parse_args()
+
+    work_dir   = Path(args.work_dir)
+    output_dir = Path(args.output_dir)
+    ligand     = Path(args.ligand)
+
+    # Validation that the candidate ran through the loop
+    if not work_dir.exists():
+        print(f"ERROR: Work directory not found: {work_dir}")
+        sys.exit(1)
+    if not ligand.exists():
+        print(f"ERROR: Ligand file not found: {ligand}")
+        sys.exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Summary log 
+    log_path = output_dir / "docking_summary.txt"
+    logf = open(log_path, "w")
+    log(f"run_gnina_docking_batch_2OG.py", logf)
+    log(f"Started  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", logf)
+    log(f"Work dir : {work_dir}", logf)
+    log(f"Out dir  : {output_dir}", logf)
+    log(f"Ligand   : {ligand}", logf)
+    log(f"CPUs     : {args.cpus}", logf)
+    log(f"{'='*58}", logf)
+
+    # Confirm receptor and autobox pair for each candidate 
+    pairs, missing_receptors = find_pairs(work_dir)
+
+    if missing_receptors:
+        for m in missing_receptors:
+            log(f"WARNING: No receptor found for {m}", logf)
+
+    if not pairs:
+        log(f"ERROR: No receptor/autobox pairs found under {work_dir}", logf)
+        logf.close()
+        sys.exit(1)
+
+    total = len(pairs)
+    log(f"Found {total} docking job(s) across "
+        f"{len(set(p['accession'] for p in pairs))} accession(s)\n", logf)
+
+    # Highlight whether candidates were successful 
+    completed = []
+    failed    = []
+    skipped   = []
+
+    # Main
+    for i, pair in enumerate(pairs, start=1):
+        acc      = pair["accession"]
+        base_id  = pair["base_id"]
+        receptor = pair["receptor"]
+        autobox  = pair["autobox"]
+
+        # Output goes into its own accession subfolder
+        acc_out = output_dir / acc
+        acc_out.mkdir(parents=True, exist_ok=True)
+        output_sdf = acc_out / f"{base_id}_docked.sdf"
+
+        prefix = f"[{timestamp()}] [{i}/{total}] {acc}"
+
+        # Skip if already done
+        if output_sdf.exists():
+            log(f"{prefix}  SKIPPED (already done)", logf)
+            skipped.append(acc)
+            continue
+
+        log(f"{prefix}  Running...", logf)
+
+        returncode, stdout, stderr = run_gnina(
+            receptor   = receptor,
+            ligand     = ligand,
+            autobox    = autobox,
+            output_sdf = output_sdf,
+            cpus       = args.cpus,
+        )
+
+        if returncode == 0:
+            log(f"{prefix}  DONE", logf)
+            completed.append(acc)
+
+            # Log GNINA's affinity/score table lines
+            score_lines = [
+                line for line in stdout.splitlines()
+                if any(kw in line for kw in
+                       ["mode", "affinity", "Affinity", "CNNscore"])
+            ]
+            for line in score_lines:
+                log(f"    {line}", logf)
+
+        else:
+            log(f"{prefix}  FAILED", logf)
+            log(f"    stderr: {stderr[:300]}", logf)
+            failed.append(acc)
+
+            # Write error log 
+            err_log = acc_out / f"{base_id}_error.log"
+            with open(err_log, "w") as f:
+                f.write(f"GNINA failed for: {base_id}\n")
+                f.write(f"Accession : {acc}\n")
+                f.write(f"Receptor  : {receptor}\n")
+                f.write(f"Autobox   : {autobox}\n\n")
+                f.write("STDOUT:\n")
+                f.write(stdout)
+                f.write("\nSTDERR:\n")
+                f.write(stderr)
+            log(f"    Error log: {err_log.name}", logf)
+
+    # Summary 
+    summary = (
+        f"\n{'='*58}\n"
+        f"Finished : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"{'='*58}\n"
+        f"  Total jobs : {total}\n"
+        f"  Completed  : {len(completed)}\n"
+        f"  Skipped    : {len(skipped)}\n"
+        f"  Failed     : {len(failed)}\n"
+    )
+    if failed:
+        summary += f"\nFailed accessions (error logs in output subfolders):\n"
+        for name in failed:
+            summary += f"  {name}\n"
+    summary += f"\nResults written to : {output_dir}\n"
+    summary += f"Summary log        : {log_path}\n"
+
+    log(summary, logf)
+    logf.close()
+
+
+if __name__ == "__main__":
+    main()
