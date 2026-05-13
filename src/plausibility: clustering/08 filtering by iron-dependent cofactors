@@ -1,0 +1,393 @@
+# only for Fe(II)/2-oxoglutarate dataset 
+#!/usr/bin/env python3
+import argparse
+import os
+import re
+from collections import defaultdict
+
+# Classification
+
+RULES = [
+
+    {
+        "id": 12,
+        "stem": "group12_copper_primary",
+        "label": "Copper-primary proteins (iron not primary cofactor) — FLAGGED",
+        "boltz_ligands": ["CU"],
+        "require": [
+            r"laccase|multicopper.oxidase|ceruloplasmin|ferroxidase|"
+            r"copper.oxidase|copper.containing|cupredoxin|"
+            r"ascorbate.oxidase|bilirubin.oxidase"
+        ],
+        "exclude": [],
+        "flag": True,
+        "flag_reason": (
+            "Copper-primary enzyme. Iron cofactor is absent. "
+        ),
+    },
+
+
+    {
+        "id": 8,
+        "stem": "group8_heme_cytochrome",
+        "label": "Heme / cytochrome proteins",
+        "boltz_ligands": ["HEM or HEC"],
+        "require": [
+            r"cytochrome|heme|haem|globin|"
+            r"haemoglobin|hemoglobin|myoglobin|"
+            r"diheme|triheme|tetraheme|multiheme|"
+            r"chloroperoxidase|catalase|peroxidase"
+        ],
+        "exclude": [
+            r"cytochrome.p450.*reductase",
+            r"iron.sulfur",
+        ],
+        "flag": False,
+    },
+
+    {
+        "id": 9,
+        "stem": "group9_radical_sam",
+        "label": "Radical SAM enzymes",
+        "boltz_ligands": ["SF4", "SAM"],
+        "boltz_note": (
+            "Require both 4Fe-4S (SF4) and S-adenosylmethionine (SAM). "
+        ),
+        "require": [
+            r"radical.?sam|rsam|"
+            r"biotin.synthase|lipoyl.synthase|lipoate.synthase|"
+            r"spore.photoproduct.lyase|"
+            r"pyruvate.formate.lyase.activating|"
+            r"anaerobic.ribonucleotide.reductase.activat|"
+            r"coproporphyrinogen.III.oxidase.*anaerobic|"
+            r"\bhemN\b"
+        ],
+        "exclude": [],
+        "flag": False,
+    },
+
+
+    {
+        "id": 2,
+        "stem": "group2_2fe2s",
+        "label": "2Fe-2S / Fe-S proteins",
+        "boltz_ligands": ["FES"],
+        "require": [
+            r"rieske|ferredoxin|adrenodoxin|putidaredoxin|"
+            r"2fe.?2s|2-fe.?2-s|\[2fe-2s\]"
+        ],
+        "exclude": [r"reductase", r"4fe"],
+        "flag": False,
+    },
+
+    {
+        "id": 1,
+        "stem": "group1_4fe4s",
+        "label": "4Fe-4S cluster proteins",
+        "boltz_ligands": ["SF4"],
+        "require": [
+            r"4fe.?4s|\[4fe-4s\]|4-fe.?4-s|"
+            r"aconitase|"
+            r"NADH.dehydrogenase.*iron.sulfur|"
+            r"iron.sulfur.*NADH|"
+            r"NADH.ubiquinone.*iron.sulfur|"
+            r"high.potential.iron.sulfur|hipip"
+        ],
+        "exclude": [],
+        "flag": False,
+    },
+
+    {
+        "id": 10,
+        "stem": "group10_multi_cofactor",
+        "label": "Multi-cofactor / hybrid proteins",
+        "boltz_ligands": ["SF4/FES", "FAD", "MOS/MTE (where applicable)"],
+        "require": [
+            r"xanthine.*(dehydrogenase|oxidase)|"
+            r"aldehyde.oxidase|"
+            r"hybrid.cluster|"
+            r"sulfite.reductase.*flavoprotein|"
+            r"trimethylamine.*N-oxide.reductase|"
+            r"formate.dehydrogenase.*molybdo|"
+            r"nitrate.reductase.*molybdo|"
+            r"DMSO.reductase"
+        ],
+        "exclude": [],
+        "flag": False,
+    },
+
+
+    {
+        "id": 11,
+        "stem": "group11_ferric_reductase",
+        "label": "Ferric reductases (FAD-dependent)",
+        "boltz_ligands": ["FAD", "FE"],
+        "require": [
+            r"ferric.chelate.reductase|ferric.reductase|"
+            r"iron.reductase|fe.?iii.*reductase|"
+            r"ferredoxin.NADP.*reductase|adrenodoxin.reductase"
+        ],
+        "exclude": [],
+        "flag": False,
+    },
+
+    {
+        "id": 4,
+        "stem": "group4_fe2og_dioxygenase",
+        "label": "Fe2+ / 2-oxoglutarate-dependent (2OG) dioxygenases",
+        "boltz_ligands": ["FE", "AKG"],
+        "require": [
+            r"2.oxoglutarate|2-oxoglutarate|oxoglutarate.dependent|"
+            r"alpha.ketoglutarate|"
+            r"taurine.dioxygenase|tauD|tfdA|"
+            r"AlkB|alkylation.repair|"
+            r"JmjC|jumonji|histone.demethylase|lysine.demethylase|"
+            r"prolyl.hydroxylase|procollagen.*hydroxylase|"
+            r"lysyl.hydroxylase|asparaginyl.hydroxylase|"
+            r"HIF.*hydroxylase|PHD.*domain|EGLN|"
+            r"OGFOD|ribosomal.*oxygenase|"
+            r"factor.inhibiting.HIF|\bFIH\b|"
+            r"phytanoyl.CoA.dioxygenase|PAHX|"
+            r"hypoxia.inducible"
+        ],
+        "exclude": [r"cysteine.dioxygenase|\bCDO\b", r"superoxide.dismutase"],
+        "flag": True,
+    },
+# Catch additional Fe(II)/2-oxoglutarate proteins 
+    {
+        "id": 4,
+        "stem": "group4_fe2og_dioxygenase",
+        "label": "Fe2+ / 2-oxoglutarate-dependent (2OG) dioxygenases",
+        "boltz_ligands": ["FE", "AKG"],
+        "require": [r"dioxygenase|hydroxylase|demethylase|oxygenase"],
+        "exclude": [
+            r"cysteine.dioxygenase|\bCDO\b",
+            r"superoxide.dismutase",
+            r"heme|haem|cytochrome",
+            r"rieske|fatty.acid",
+            r"coproporphyrinogen",
+            r"radical.sam",
+            r"copper|laccase",
+            r"xanthine|aldehyde.oxidase",
+        ],
+        "flag": False,
+    },
+
+    {
+        "id": 5,
+        "stem": "group5_cdo",
+        "label": "Cysteine dioxygenase (CDO) — mononuclear Fe2+",
+        "boltz_ligands": ["FE"],
+        "require": [r"cysteine.dioxygenase|\bCDO\b"],
+        "exclude": [],
+        "flag": False,
+    },
+
+    {
+        "id": 6,
+        "stem": "group6_fe_sod",
+        "label": "Iron superoxide dismutase (Fe-SOD)",
+        "boltz_ligands": ["FE"],
+        "require": [r"superoxide.dismutase"],
+        "exclude": [r"copper|manganese|mn.sod|cu.zn"],
+        "flag": False,
+    },
+
+    {
+        "id": 7,
+        "stem": "group7_fatty_acid_hydroxylase_diiron",
+        "label": "Fatty acid hydroxylase / membrane-bound di-iron",
+        "boltz_ligands": ["FE x2"],
+        "require": [
+            r"fatty.acid.hydroxylase|fatty.acid.desaturase|"
+            r"sphingolipid.delta.4.desaturase|"
+            r"stearoyl.CoA.desaturase|delta.?9.desaturase|"
+            r"alkane.monooxygenase|alkane.hydroxylase|"
+            r"particulate.methane.monooxygenase|"
+            r"sterol.desaturase|C-4.methylsterol.oxidase"
+        ],
+        "exclude": [],
+        "flag": False,
+    },
+
+    {
+        "id": 3,
+        "stem": "group3_fe_s_general",
+        "label": "General / unspecified Fe-S proteins",
+        "boltz_ligands": ["FES or SF4"],
+        "require": [
+            r"iron.sulf|iron-sulf|iron.sulph|\[fe-s\]|fe-s.cluster|"
+            r"ferredoxin.like"
+        ],
+        "exclude": [
+            r"rieske|4fe|radical.sam|xanthine|hybrid.cluster|"
+            r"NADH.dehydrogenase.*iron.sulfur"
+        ],
+        "flag": False,
+    },
+
+    {
+        "id": 13,
+        "stem": "group13_mononuclear_fe_other",
+        "label": "Mononuclear Fe2+ — other (Fe-ADH, ARD, queD-like)",
+        "boltz_ligands": ["FE"],
+        "require": [
+            r"iron.containing.alcohol.dehydrogenase|"
+            r"iron.alcohol.dehydrogenase|"
+            r"acireductone.dioxygenase|\bARD\b|"
+            r"queuosine.*iron|queD"
+        ],
+        "exclude": [],
+        "flag": False,
+    },
+]
+
+def parse_fasta(path):
+    header, seqlines = None, []
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if not line or line.startswith(";"):
+                continue
+            if line.startswith(">"):
+                if header is not None:
+                    yield header, "".join(seqlines)
+                header = line[1:]
+                seqlines = []
+            else:
+                seqlines.append(line)
+    if header is not None:
+        yield header, "".join(seqlines)
+
+
+def protein_description(header):
+    parts = header.split(None, 1)
+    return parts[1] if len(parts) > 1 else parts[0]
+
+
+def classify(header):
+    desc = protein_description(header)
+    for rule in RULES:
+        if not all(re.search(p, desc, re.IGNORECASE) for p in rule["require"]):
+            continue
+        if any(re.search(p, desc, re.IGNORECASE) for p in rule.get("exclude", [])):
+            continue
+        return rule
+    return None
+
+
+def format_file_header(rule):
+    return (
+        f"; ── Group {rule['id']}: {rule['label']} ──\n"
+        f"; Boltz ligand(s): {', '.join(rule['boltz_ligands'])}\n"
+        f"; Note: {rule['boltz_note']}\n"
+        ";\n"
+    )
+
+
+def write_record(fh, header, seq, width=60):
+    fh.write(f">{header}\n")
+    for i in range(0, len(seq), width):
+        fh.write(seq[i:i+width] + "\n")
+
+# Main 
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="iron-protein FASTA split by cofactor group for Boltz YAML."
+    )
+    parser.add_argument("fasta", help="Input multi-sequence FASTA file")
+    parser.add_argument("--outdir", default="cofactor_groups")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print every classification decision")
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+    sequences = list(parse_fasta(args.fasta))
+    print(f"Read {len(sequences)} sequences from {args.fasta}\n")
+
+    buckets = defaultdict(list)
+    stem_to_rule = {}
+    unclassified = []
+    flagged = []
+
+    for header, seq in sequences:
+        rule = classify(header)
+        if rule is None:
+            unclassified.append((header, seq))
+            if args.verbose:
+                print(f"  [UNCLASSIFIED] {header[:90]}")
+        else:
+            buckets[rule["stem"]].append((header, seq))
+            stem_to_rule[rule["stem"]] = rule
+            if rule.get("flag"):
+                flagged.append((header, seq, rule["flag_reason"]))
+            if args.verbose:
+                desc = protein_description(header)[:55]
+                print(f"  [G{rule['id']:02d}] {rule['stem']:<42} {desc}")
+
+    seen_stems = sorted(stem_to_rule, key=lambda s: stem_to_rule[s]["id"])
+    counts = {}
+    for stem in seen_stems:
+        rule = stem_to_rule[stem]
+        records = buckets[stem]
+        outpath = os.path.join(args.outdir, f"{stem}.fasta")
+        with open(outpath, "w") as fh:
+            fh.write(format_file_header(rule))
+            for h, s in records:
+                write_record(fh, h, s)
+        counts[stem] = len(records)
+        print(f"  Wrote {len(records):4d}  →  {stem}.fasta")
+
+    if unclassified:
+        outpath = os.path.join(args.outdir, "unclassified.fasta")
+        with open(outpath, "w") as fh:
+            fh.write(
+                "; ── Unclassified sequences ──\n"
+                "; No keyword pattern matched the protein description.\n"
+                "; Action: check UniProt annotation or run BLAST against\n"
+                ";         characterised iron proteins before assigning Boltz cofactors.\n"
+                ";\n"
+            )
+            for h, s in unclassified:
+                write_record(fh, h, s)
+        print(f"\n  Wrote {len(unclassified):4d}  →  unclassified.fasta")
+    else:
+        print("\n  All proteins classified — no unclassified.fasta written.")
+
+    # Flagged
+    all_flagged = flagged + [
+        (h, s, "No cofactor pattern matched — manual review required")
+        for h, s in unclassified
+    ]
+    if all_flagged:
+        outpath = os.path.join(args.outdir, "flagged_do_not_assign_fe.fasta")
+        with open(outpath, "w") as fh:
+            fh.write(
+                "; ── FLAGGED: review ──\n"
+                "; Contains copper-primary proteins and unclassified sequences.\n"
+                "; Reason appended to each header as [FLAG: ...].\n"
+                ";\n"
+            )
+            for h, s, reason in all_flagged:
+                write_record(fh, f"{h} [FLAG: {reason}]", s)
+        print(f"  Wrote {len(all_flagged):4d}  →  flagged_do_not_assign_fe.fasta")
+
+    # Summary
+    total = len(sequences)
+    classified = total - len(unclassified)
+    print(f"\n{'='*62}")
+    print(f"  Total : {total}   Classified : {classified} ({100*classified/total:.1f}%)   Unclassified : {len(unclassified)}")
+    print(f"{'─'*62}")
+    print(f"  {'Group':<44} {'Ligand(s)':<22} {'N':>4}")
+    print(f"  {'─'*43} {'─'*21} {'─'*4}")
+    for stem in seen_stems:
+        rule = stem_to_rule[stem]
+        ligs = ", ".join(rule["boltz_ligands"])
+        print(f"  {rule['label'][:43]:<44} {ligs:<22} {counts[stem]:>4}")
+    print(f"{'='*62}")
+    print(f"\nOutput: {os.path.abspath(args.outdir)}/")
+
+
+if __name__ == "__main__":
+    main()
