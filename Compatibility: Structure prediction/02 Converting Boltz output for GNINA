@@ -1,0 +1,507 @@
+"""
+Prepares GNINA-ready receptor PDB for each candidate protein by:
+
+  1. Parsing the Boltz CIF directly using BioPython structure object
+  2. Generating a canonical 2-oxoglutarate SDF using RDKit
+  3. Superimposes clean SDF onto Boltz 2OG atom positions (Kabsch algorithm)
+  4. Writing receptor PDB with correct HETATM + CONECT records
+  5. Writing PP autobox ligand PDB separately
+
+import argparse
+import os
+import sys
+import numpy as np
+from pathlib import Path
+
+try:
+    from Bio.PDB import MMCIFParser
+    from Bio import BiopythonWarning
+    import warnings
+    warnings.simplefilter('ignore', BiopythonWarning)
+except ImportError:
+    print("pip install biopython --break-system-packages")
+    sys.exit(1)
+
+try:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+except ImportError:
+    print("conda install -c conda-forge rdkit")
+    sys.exit(1)
+
+
+# Clean labelling and formatting 
+
+OKG_SMILES = "OC(=O)CCC(=O)C(=O)O"
+
+OKG_BONDS = [
+    ("C13", "O11", 2),
+    ("C13", "O8",  1),
+    ("C13", "C15", 1),
+    ("C15", "C16", 1),
+    ("C16", "C14", 1),
+    ("C14", "O9",  2),
+    ("C14", "C12", 1),
+    ("C12", "O7",  1),
+    ("C12", "O10", 2),
+]
+
+FE_COORD_ATOMS = ["O7", "O9"]
+
+STANDARD_AA = {
+    'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS',
+    'ILE','LEU','LYS','MET','PHE','PRO','SER','THR','TRP',
+    'TYR','VAL','SEC','PYL','MSE'
+}
+
+
+
+def extract_from_cif(cif_path):
+
+    parser = MMCIFParser(QUIET=True)
+    structure = parser.get_structure("boltz", str(cif_path))
+
+    protein_atoms = []
+    fe_atoms      = []
+    okg_atoms     = []
+    ligand_atoms  = []
+
+    model = next(structure.get_models()) 
+
+    for chain in model:
+        chain_id = chain.id
+        for residue in chain.get_residues():
+            resname = residue.resname.strip()
+            resseq  = residue.get_id()[1]
+
+            for atom in residue.get_atoms():
+                entry = {
+                    "name":    atom.name.strip(),
+                    "resname": resname,
+                    "chain":   chain_id,
+                    "resseq":  resseq,
+                    "x":       float(atom.coord[0]),
+                    "y":       float(atom.coord[1]),
+                    "z":       float(atom.coord[2]),
+                    "bfactor": float(atom.bfactor),
+                    "element": atom.element.strip() if atom.element else "",
+                }
+
+                if chain_id == "A":
+                    protein_atoms.append(entry)
+                elif chain_id == "C":
+                    fe_atoms.append(entry)
+                elif chain_id == "D":
+                    okg_atoms.append(entry)
+                elif chain_id == "B":
+                    ligand_atoms.append(entry)
+
+    print(f"  Extracted from CIF:")
+    print(f"    Protein (A) : {len(protein_atoms)} atoms")
+    print(f"    Fe      (C) : {len(fe_atoms)} atoms")
+    print(f"    2OG     (D) : {len(okg_atoms)} atoms")
+    print(f"    PP      (B) : {len(ligand_atoms)} atoms")
+
+    if not fe_atoms:
+        print("  No Fe atoms in chain C — check CIF chain assignments")
+    if not okg_atoms:
+        print("  No 2OG atoms in chain D — check CIF chain assignments")
+    if not ligand_atoms:
+        print("  No PP ligand atoms in chain B")
+
+    return protein_atoms, fe_atoms, okg_atoms, ligand_atoms
+
+
+# RDKit generate clean geometry of 2OG cofactor 
+
+def generate_clean_2og(sdf_out_path):
+    mol = Chem.MolFromSmiles(OKG_SMILES)
+    if mol is None:
+        raise ValueError(f"RDKit could not parse SMILES: {OKG_SMILES}")
+    mol_h = Chem.AddHs(mol)
+    result = AllChem.EmbedMolecule(mol_h, AllChem.ETKDGv3())
+    if result != 0:
+        AllChem.EmbedMolecule(mol_h, AllChem.ETDG())
+    AllChem.MMFFOptimizeMolecule(mol_h)
+    writer = Chem.SDWriter(str(sdf_out_path))
+    writer.write(mol_h)
+    writer.close()
+    mol_heavy = Chem.RemoveHs(mol_h)
+    print(f"  Clean 2OG SDF written: {Path(sdf_out_path).name}")
+    return mol_h, mol_heavy
+
+
+# Match RDKit 2OG to Boltz 2OG by atom names 
+
+def build_rdkit_adjacency(mol):
+    adj = {i: [] for i in range(mol.GetNumAtoms())}
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        adj[i].append(j)
+        adj[j].append(i)
+    return adj
+
+
+def match_rdkit_to_boltz(mol_heavy):
+
+    adj = build_rdkit_adjacency(mol_heavy)
+
+    rdkit_atoms = []
+    for i, atom in enumerate(mol_heavy.GetAtoms()):
+        rdkit_atoms.append({
+            "idx":       i,
+            "element":   atom.GetSymbol().upper(),
+            "degree":    len(adj[i]),
+            "neighbors": adj[i],
+        })
+
+    mapping = {}  # rdkit_idx -> boltz_name
+
+    # --- Carbons by degree ---
+    c3 = [a for a in rdkit_atoms if a["element"] == "C" and a["degree"] == 3]
+    c2 = [a for a in rdkit_atoms if a["element"] == "C" and a["degree"] == 2]
+
+    for a in c3:
+        n_oxy = sum(
+            1 for nb in a["neighbors"]
+            if mol_heavy.GetAtomWithIdx(nb).GetSymbol().upper() == "O"
+        )
+        if n_oxy == 2:
+            c_nbs = [nb for nb in a["neighbors"]
+                     if mol_heavy.GetAtomWithIdx(nb).GetSymbol().upper() == "C"]
+            if c_nbs and len(adj[c_nbs[0]]) == 2:
+                mapping[a["idx"]] = "C13"
+            else:
+                mapping[a["idx"]] = "C12"
+        elif n_oxy == 1:
+            mapping[a["idx"]] = "C14"
+
+    c13_idx = next((k for k, v in mapping.items() if v == "C13"), None)
+    c14_idx = next((k for k, v in mapping.items() if v == "C14"), None)
+
+    for a in c2:
+        if c13_idx is not None and c13_idx in a["neighbors"]:
+            mapping[a["idx"]] = "C15"
+        elif c14_idx is not None and c14_idx in a["neighbors"]:
+            mapping[a["idx"]] = "C16"
+        else:
+            if "C15" not in mapping.values():
+                mapping[a["idx"]] = "C15"
+            else:
+                mapping[a["idx"]] = "C16"
+
+    c12_idx = next((k for k, v in mapping.items() if v == "C12"), None)
+
+    for a in rdkit_atoms:
+        if a["element"] != "O" or a["idx"] in mapping:
+            continue
+        bonded_c = a["neighbors"][0] if a["neighbors"] else None
+        if bonded_c is None:
+            continue
+        bonded_c_name = mapping.get(bonded_c, "")
+        bond = mol_heavy.GetBondBetweenAtoms(a["idx"], bonded_c)
+        is_double = bond is not None and bond.GetBondTypeAsDouble() >= 1.9
+
+        if bonded_c_name == "C13":
+            mapping[a["idx"]] = "O11" if is_double else "O8"
+        elif bonded_c_name == "C14":
+            mapping[a["idx"]] = "O9"
+        elif bonded_c_name == "C12":
+            mapping[a["idx"]] = "O10" if is_double else "O7"
+
+    # Invert: boltz_name -> rdkit_idx
+    return {v: k for k, v in mapping.items()}
+
+
+# Kabsch superimposition 
+
+def superimpose(mol_heavy, boltz_name_to_rdkit, boltz_okg_by_name):
+
+    conf = mol_heavy.GetConformer()
+
+    rdkit_pts  = []
+    boltz_pts  = []
+    names_used = []
+
+    for bname, ridx in boltz_name_to_rdkit.items():
+        if bname not in boltz_okg_by_name:
+            continue
+        b = boltz_okg_by_name[bname]
+        r = conf.GetAtomPosition(ridx)
+        rdkit_pts.append([r.x, r.y, r.z])
+        boltz_pts.append([b["x"], b["y"], b["z"]])
+        names_used.append(bname)
+
+    n = len(names_used)
+    print(f"  Superimposition using {n} atom pairs: {names_used}")
+
+    if n < 3:
+        print(f"  Only {n} matched pairs — need at least 3 for superimposition")
+        print(f"   Using Boltz coordinates directly")
+        return {name: (a["x"], a["y"], a["z"])
+                for name, a in boltz_okg_by_name.items()}
+
+    P = np.array(rdkit_pts)   
+    Q = np.array(boltz_pts)  
+
+    P_c = P - P.mean(axis=0)
+    Q_c = Q - Q.mean(axis=0)
+
+    H = P_c.T @ Q_c
+    U, S, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    R = Vt.T @ np.diag([1, 1, d]) @ U.T
+    t = Q.mean(axis=0) - R @ P.mean(axis=0)
+
+    rmsd_before = np.sqrt(((P - Q)**2).sum(axis=1).mean())
+    P_aligned   = (R @ P.T).T + t
+    rmsd_after  = np.sqrt(((P_aligned - Q)**2).sum(axis=1).mean())
+    print(f"  RMSD: {rmsd_before:.3f} Å → {rmsd_after:.3f} Å")
+
+    # Apply to all RDKit heavy atoms
+    result = {}
+    for bname, ridx in boltz_name_to_rdkit.items():
+        r = conf.GetAtomPosition(ridx)
+        new = R @ np.array([r.x, r.y, r.z]) + t
+        result[bname] = (float(new[0]), float(new[1]), float(new[2]))
+
+    # Fallback for any unmatched Boltz atoms
+    for name, a in boltz_okg_by_name.items():
+        if name not in result:
+            result[name] = (a["x"], a["y"], a["z"])
+
+    return result
+
+
+# PDB formatting 
+
+def fmt(record, serial, name, resname, chain, resseq,
+        x, y, z, bfactor, element):
+    nf = f" {name:<3}" if len(name) < 4 else f"{name:<4}"
+    return (
+        f"{record:<6}{serial:5d} {nf} "
+        f"{resname:<3} {chain}{int(resseq):4d}    "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}"
+        f"  1.00{float(bfactor):6.2f}"
+        f"          {element:>2}  \n"
+    )
+
+
+# Format PDB receptor 
+
+def write_receptor(protein_atoms, fe_atoms, okg_atoms,
+                   superimposed_2og, output_pdb):
+
+    lines   = []
+    counter = 1
+
+    # Protein chain A
+    for a in protein_atoms:
+        record = "ATOM  " if a["resname"] in STANDARD_AA else "HETATM"
+        elem   = a["element"] if a["element"] else a["name"][0].upper()
+        lines.append(fmt(record, counter, a["name"], a["resname"],
+                         "A", a["resseq"], a["x"], a["y"], a["z"],
+                         a["bfactor"], elem))
+        counter += 1
+
+    if protein_atoms:
+        last = protein_atoms[-1]
+        lines.append(f"TER   {counter:5d}      "
+                     f"{last['resname']:<3} A{int(last['resseq']):4d}\n")
+        counter += 1
+
+    # Fe chain C
+    fe_serial = None
+    if fe_atoms:
+        fe = fe_atoms[0]
+        fe_serial = counter
+        lines.append(fmt("HETATM", counter, "FE", "FE2", "C", 1,
+                         fe["x"], fe["y"], fe["z"], fe["bfactor"], "FE"))
+        counter += 1
+        lines.append(f"TER   {counter:5d}      FE2 C   1\n")
+        counter += 1
+
+    okg_order = []
+    seen = set()
+    for a1, a2, _ in OKG_BONDS:
+        for n in (a1, a2):
+            if n not in seen:
+                okg_order.append(n)
+                seen.add(n)
+    for name in superimposed_2og:
+        if name not in seen:
+            okg_order.append(name)
+            seen.add(name)
+
+    okg_serials  = {}
+    written_okg  = []
+    okg_bf_map   = {a["name"]: a["bfactor"] for a in okg_atoms}
+
+    for name in okg_order:
+        if name not in superimposed_2og:
+            continue
+        x, y, z = superimposed_2og[name]
+        elem     = next((c for c in name if c.isalpha()), "C").upper()
+        bf       = okg_bf_map.get(name, 0.0)
+        okg_serials[name] = counter
+        lines.append(fmt("HETATM", counter, name, "2OG", "D", 1,
+                         x, y, z, bf, elem))
+        written_okg.append(name)
+        counter += 1
+
+    if written_okg:
+        lines.append(f"TER   {counter:5d}      2OG D   1\n")
+        counter += 1
+
+    conect = []
+    for a1n, a2n, bond_order in OKG_BONDS:
+        s1 = okg_serials.get(a1n)
+        s2 = okg_serials.get(a2n)
+        if not (s1 and s2):
+            continue
+        conect.append(f"CONECT{s1:5d}{s2:5d}\n")
+        conect.append(f"CONECT{s2:5d}{s1:5d}\n")
+        if bond_order == 2:
+            conect.append(f"CONECT{s1:5d}{s2:5d}\n")
+            conect.append(f"CONECT{s2:5d}{s1:5d}\n")
+
+    if fe_serial:
+        for coord_name in FE_COORD_ATOMS:
+            s_okg = okg_serials.get(coord_name)
+            if s_okg:
+                conect.append(f"CONECT{fe_serial:5d}{s_okg:5d}\n")
+                conect.append(f"CONECT{s_okg:5d}{fe_serial:5d}\n")
+
+    lines.extend(conect)
+    lines.append("END\n")
+
+    Path(output_pdb).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_pdb, "w") as f:
+        f.writelines(lines)
+
+    print(f"\n  Protein atoms : {len(protein_atoms)}")
+    print(f"  Fe written    : {'yes' if fe_serial else 'no'}")
+    print(f"  2OG atoms     : {len(written_okg)}")
+    print(f"  CONECT records: {len(conect)}")
+
+    # Fe coordination distance check
+    if fe_atoms and fe_serial:
+        fe = fe_atoms[0]
+        print(f"\n  Fe position: ({fe['x']:.3f}, {fe['y']:.3f}, {fe['z']:.3f})")
+        for coord_name in FE_COORD_ATOMS:
+            if coord_name in superimposed_2og:
+                cx, cy, cz = superimposed_2og[coord_name]
+                d = ((fe["x"]-cx)**2 + (fe["y"]-cy)**2 + (fe["z"]-cz)**2)**0.5
+                ok = "coordination OK" if d < 2.5 else "check Fe placement"
+                print(f"  Fe — {coord_name}: {d:.2f} Å  {ok}")
+
+
+# Write Autobox ligand for each candidate 
+
+def write_autobox(ligand_atoms, output_pdb):
+    if not ligand_atoms:
+        print("  No PP ligand atoms to write")
+        return
+
+    lines   = []
+    counter = 1
+    for a in ligand_atoms:
+        elem = next((c for c in a["name"] if c.isalpha()), "C").upper()
+        lines.append(fmt("HETATM", counter, a["name"], "LIG",
+                         "B", 1, a["x"], a["y"], a["z"],
+                         a["bfactor"], elem))
+        counter += 1
+    lines.append("END\n")
+
+    with open(output_pdb, "w") as f:
+        f.writelines(lines)
+
+    xs = [a["x"] for a in ligand_atoms]
+    ys = [a["y"] for a in ligand_atoms]
+    zs = [a["z"] for a in ligand_atoms]
+    cx = sum(xs)/len(xs)
+    cy = sum(ys)/len(ys)
+    cz = sum(zs)/len(zs)
+    print(f"  PP ligand atoms : {len(ligand_atoms)}")
+    print(f"  Centroid        : ({cx:.2f}, {cy:.2f}, {cz:.2f})")
+    print(f"  Span            : ({max(xs)-min(xs):.1f}, "
+          f"{max(ys)-min(ys):.1f}, {max(zs)-min(zs):.1f}) Å")
+
+
+# Main
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cif",    "-c", required=True)
+    parser.add_argument("--outdir", "-o", default="gnina_ready")
+    args = parser.parse_args()
+
+    cif_path = Path(args.cif)
+    if not cif_path.exists():
+        print(f"CIF not found: {cif_path}")
+        sys.exit(1)
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    stem = cif_path.stem
+
+    out_receptor = outdir / f"{stem}_receptor_gnina.pdb"
+    out_autobox  = outdir / f"{stem}_autobox_ligand.pdb"
+    out_sdf      = outdir / "2og_clean_template.sdf"
+
+    # Extract directly from CIF
+    print(f"\nParsing: {cif_path.name}")
+    protein_atoms, fe_atoms, okg_atoms, ligand_atoms = extract_from_cif(cif_path)
+
+    # Generate clean 2OG
+    print(f"\n── Generating clean 2OG template ──")
+    mol_h, mol_heavy = generate_clean_2og(out_sdf)
+
+    # Match RDKit atoms to Boltz atom names
+    print(f"\n── Matching RDKit atoms to Boltz atom names ──")
+    boltz_name_to_rdkit = match_rdkit_to_boltz(mol_heavy)
+    matched = len(boltz_name_to_rdkit)
+    print(f"  Matched {matched} / 10 2OG atoms")
+    for bname, ridx in sorted(boltz_name_to_rdkit.items()):
+        elem = mol_heavy.GetAtomWithIdx(ridx).GetSymbol()
+        print(f"    {bname:>4}  →  RDKit atom {ridx} ({elem})")
+
+    # Superimpose
+    print(f"\n── Superimposing clean 2OG onto Boltz positions ──")
+    okg_by_name = {a["name"]: a for a in okg_atoms}
+    superimposed_coords = superimpose(mol_heavy, boltz_name_to_rdkit, okg_by_name)
+
+    # Write receptor
+    print(f"\n── Writing receptor PDB ──")
+    write_receptor(protein_atoms, fe_atoms, okg_atoms,
+                   superimposed_coords, str(out_receptor))
+    print(f"  {out_receptor.name}")
+
+    # Write autobox ligand
+    print(f"\n── Writing autobox ligand ──")
+    write_autobox(ligand_atoms, str(out_autobox))
+    print(f"  {out_autobox.name}")
+
+    print(f"""
+{'='*60}
+Files ready for GNINA
+{'='*60}
+  Receptor  : {out_receptor}
+  Autobox   : {out_autobox}
+  2OG SDF   : {out_sdf}
+
+GNINA command:
+  gnina \\
+    --receptor       {out_receptor} \\
+    --ligand         YOUR_PP_LIGAND.sdf \\
+    --autobox_ligand {out_autobox} \\
+    --autobox_add    4 \\
+    --exhaustiveness 8 \\
+    --num_modes      9 \\
+    --out            docking_output.sdf
+{'='*60}
+""")
+
+
+if __name__ == "__main__":
+    main()
