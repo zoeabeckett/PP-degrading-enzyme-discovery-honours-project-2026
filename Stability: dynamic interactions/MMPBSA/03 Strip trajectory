@@ -1,0 +1,71 @@
+#!/bin/bash
+
+
+# Converts DCD trajectories to stripped NetCDF for the positive control
+# Keeps Protein, 2-oxoglutarate (2OG), Iron (FE), and Ligand (LIG).
+
+
+set -euo pipefail
+
+# Configuration
+CANDIDATES=("positive_control")
+STRIDE=${STRIDE:-5} 
+
+if [[ $# -gt 0 ]]; then CANDIDATES=("$@"); fi
+
+
+echo "  Step 3: Strip trajectories with cpptraj"
+echo "  System: Non-Heme (Keeping 2OG + FE)"
+echo "  Stride: every ${STRIDE} frames"
+
+
+for name in "${CANDIDATES[@]}"; do
+
+    out_dir="mmpbsa_results/${name}"
+    dcd="${name}/trajectory_${name}_holo.dcd"
+    prmtop="${out_dir}/complex_solv.prmtop"
+    traj_nc="${out_dir}/traj_stripped.nc"
+
+
+    echo "  Candidate: ${name}"
+
+    if [[ ! -f "$dcd" ]]; then
+        echo "  MISSING DCD: $dcd"
+        continue
+    fi
+
+    if [[ ! -f "$prmtop" ]]; then
+        echo "  MISSING PRMTOP: $prmtop (Run Step 02 first)"
+        continue
+    fi
+
+    if [[ -f "$traj_nc" ]]; then
+        echo "  [SKIP] Stripped trajectory already exists for ${name}."
+        continue
+    fi
+
+    # Create cpptraj input
+    # Note: not stripping 2OG or FE because they are part of the receptor
+    cat > "${out_dir}/strip.cpptraj" << EOF
+parm ${prmtop}
+trajin ${dcd} 1 last ${STRIDE}
+strip :WAT,HOH,TIP3
+strip :Cl-,CL-,Na+,NA+,K+,MG,CA
+rms ToRef @CA,C,N first
+trajout ${traj_nc} netcdf
+go
+EOF
+
+    echo "  Running cpptraj..."
+    cpptraj -i "${out_dir}/strip.cpptraj" > "${out_dir}/cpptraj.log" 2>&1
+
+    if [[ -f "$traj_nc" ]]; then
+        echo "  SUCCESS: traj_stripped.nc created."
+        echo "  Size: $(ls -lh $traj_nc | awk '{print $5}')"
+    else
+        echo "  ERROR: cpptraj failed. Check ${out_dir}/cpptraj.log"
+        tail -n 10 "${out_dir}/cpptraj.log"
+    fi
+done
+
+echo "  Step 03 complete. Ready for MMPBSA calculation."
