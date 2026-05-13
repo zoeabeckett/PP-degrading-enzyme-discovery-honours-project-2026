@@ -9,6 +9,7 @@ INPUT_MATRIX = "05_protein_embeddings_matrix.npy"
 INPUT_LABELS = "05_protein_labels.npy"
 OUTPUT_PLOT = "06_tsne_plot.png"
 
+# Parameters
 PERPLEXITY = 30 
 LEARNING_RATE = "auto"
 N_ITER = 1000   
@@ -20,12 +21,12 @@ def run_analysis()
     
     print(f"Data Shape: {X.shape} (Proteins x Dimensions)")
     print(f"Labels Shape: {y.shape}")
-
+    # PCA step 
     print("Running PCA to reduce to 50 dimensions...")
     pca = PCA(n_components=50)
     X_pca = pca.fit_transform(X)
     print(f"PCA Done. Shape is now: {X_pca.shape}")
-
+    # t-SNE transformation 
     print(f"Running t-SNE (Perplexity={PERPLEXITY})...")
     tsne = TSNE(n_components=2, 
                 perplexity=PERPLEXITY, 
@@ -37,6 +38,7 @@ def run_analysis()
     
     X_embedded = tsne.fit_transform(X_pca)
 
+    # Organising data for generating plots 
     df = pd.DataFrame(X_embedded, columns=['x', 'y'])
     df['label'] = y 
 
