@@ -1,0 +1,90 @@
+import os
+import subprocess
+import time
+import glob
+import datetime
+import sys
+
+# Configuration
+INPUT_DIR = "boltz_inputs"
+OUTPUT_DIR = "boltz_results_affinity_non_heme"
+LOG_FILE = "run_log_python.txt"
+
+# Check output directory 
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+yaml_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.yaml")))
+total_files = len(yaml_files)
+
+# If no files found, stop immediately
+if total_files == 0:
+    print(f"ERROR: No YAML files found in '{INPUT_DIR}'")
+    sys.exit(1)
+
+# Log function
+def write_log(message):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted_message = f"[{timestamp}] {message}"
+    print(formatted_message)
+    with open(LOG_FILE, "a") as f:
+        f.write(formatted_message + "\n")
+
+write_log("==================================================")
+write_log(f"   STARTING BATCH RUN ")
+write_log(f"   Input: {INPUT_DIR}")
+write_log(f"   Output: {OUTPUT_DIR}")
+write_log(f"   Total Files: {total_files}")
+write_log("==================================================")
+
+start_time = time.time()
+processed_count = 0
+
+for i, yaml_file in enumerate(yaml_files):
+    # 1. Extract candidate YAML file 
+    filename = os.path.basename(yaml_file)
+    base_id = os.path.splitext(filename)[0]
+    
+    # Define output folder
+    target_output_dir = os.path.join(OUTPUT_DIR, base_id)
+
+
+    if os.path.exists(target_output_dir):
+        print(f"Skipping {base_id} (Already done)")
+        continue
+
+
+    processed_count += 1
+    current_time = time.time()
+    elapsed_time = current_time - start_time
+    
+    avg_time = elapsed_time / processed_count
+    remaining_files = total_files - (i + 1)
+    est_seconds_left = remaining_files * avg_time
+    est_time_str = str(datetime.timedelta(seconds=int(est_seconds_left)))
+    
+    write_log(f"--------------------------------------------------")
+    write_log(f"Processing {i+1}/{total_files}: {base_id}")
+    write_log(f" Estimate time Remaining: {est_time_str}")
+
+    # 4. Boltz-2 run 
+    command = [
+        "boltz", "predict", yaml_file,
+        "--out_dir", target_output_dir,
+        "--use_msa_server",
+        "--recycling_steps", "3"
+    ]  
+
+    try:
+
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        write_log(f"  Success: {base_id}")
+        
+    except subprocess.CalledProcessError as e:
+        write_log(f"  FAILED: {base_id}")
+        # Only log the error message if it exists
+        if e.stderr:
+            write_log(f"      Error: {e.stderr.decode().strip()}")
+
+write_log("==================================================")
+write_log("   Done. Batch run complete.")
