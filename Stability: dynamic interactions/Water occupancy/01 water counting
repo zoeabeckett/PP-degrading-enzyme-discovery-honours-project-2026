@@ -1,0 +1,495 @@
+"""
+Water counting — apo vs holo active site comparison (multi-candidate)
+Counts water molecules within a defined radius of the 2OG FE2 atom
+across all frames of an MD trajectory.
+"""
+
+import os
+import glob
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from scipy.stats import mannwhitneyu
+import MDAnalysis as mda
+from MDAnalysis.analysis.distances import distance_array
+
+
+# Configuration
+
+RADII           = [5.0, 6.0, 8.0, 9.0, 10.0]   
+OXG_RESNAME     = "FE2"          
+FE_ATOM_NAME    = "FE2"            
+WATER_RESNAME   = "HOH"             
+WATER_ATOM_NAME = "O"            
+
+
+
+def find_candidate_dirs(base_dir):
+    pattern = os.path.join(base_dir, "candidate_*")
+    dirs = sorted(d for d in glob.glob(pattern) if os.path.isdir(d))
+    if not dirs:
+        raise FileNotFoundError(
+            f"No directories matching 'candidate_*' found in {base_dir}."
+        )
+    print(f"Found {len(dirs)} candidate folder(s):")
+    for d in dirs:
+        print(f"  {os.path.basename(d)}")
+    return dirs
+
+
+def find_trajectory_files(candidate_dir):
+    """
+    Find apo and holo PDB + DCD pairs inside a candidate directory.
+    Matches any file containing 'apo' or 'holo' in its name.
+    Returns dict: {'apo': (pdb, dcd), 'holo': (pdb, dcd)}
+    """
+    pairs = {}
+    for state in ("apo", "holo"):
+        pdb_matches = glob.glob(os.path.join(candidate_dir, f"*{state}*.pdb"))
+        dcd_matches = glob.glob(os.path.join(candidate_dir, f"*{state}*.dcd"))
+        if not pdb_matches or not dcd_matches:
+            raise FileNotFoundError(
+                f"Could not find {state} PDB + DCD pair in {candidate_dir}.\n"
+                f"Expected files matching *{state}*.pdb and *{state}*.dcd."
+            )
+        pairs[state] = (pdb_matches[0], dcd_matches[0])
+        print(f"    {state}: {os.path.basename(pdb_matches[0])} + "
+              f"{os.path.basename(dcd_matches[0])}")
+    return pairs
+
+
+def count_waters_per_frame(pdb_path, dcd_path, radius):
+    """
+    Load a trajectory and count water oxygens within `radius` Å
+    of the 2OG FE2 atom for every frame.
+    Returns a numpy array of water counts (one value per frame).
+    """
+    u = mda.Universe(pdb_path, dcd_path)
+
+    # Select the cofactor centre atom
+    fe_sel = u.select_atoms(f"resname {OXG_RESNAME} and name {FE_ATOM_NAME}")
+    if len(fe_sel) == 0:
+        raise ValueError(
+            f"No atom found matching resname {OXG_RESNAME} name {FE_ATOM_NAME} "
+            f"in {pdb_path}.\n"
+            f"Check OXG_RESNAME and FE_ATOM_NAME at the top of this script.\n"
+            f"To inspect available atom names run:\n"
+            f"  grep '{OXG_RESNAME}' {pdb_path} | awk '{{print $3}}' | sort -u"
+        )
+
+    # Select all water oxygens, with automatic fallback to common naming conventions
+    water_sel = u.select_atoms(f"resname {WATER_RESNAME} and name {WATER_ATOM_NAME}")
+    if len(water_sel) == 0:
+        for alt_res, alt_atom in [("SOL", "OW"), ("HOH", "O"), ("TIP3", "OH2")]:
+            water_sel = u.select_atoms(f"resname {alt_res} and name {alt_atom}")
+            if len(water_sel) > 0:
+                print(f"      Note: found waters as resname={alt_res} name={alt_atom}")
+                break
+        if len(water_sel) == 0:
+            raise ValueError(
+                f"No water atoms found in {pdb_path}. "
+                f"Check WATER_RESNAME and WATER_ATOM_NAME at the top of this script."
+            )
+
+    counts = []
+    for ts in u.trajectory:
+        dists = distance_array(water_sel.positions, fe_sel.positions, box=ts.dimensions)
+        n_waters = int(np.sum(dists <= radius))
+        counts.append(n_waters)
+
+    return np.array(counts)
+
+
+# Main
+
+def run_analysis(base_dir, output_dir):
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    candidate_dirs = find_candidate_dirs(base_dir)
+
+    # all_results[candidate_name][radius][state] = np.array of counts
+    all_results = {}
+
+    for cdir in candidate_dirs:
+        candidate_name = os.path.basename(cdir)          # e.g. "candidate_AA"
+        print(f"\n── Processing {candidate_name} ──────────────────────────────")
+
+        try:
+            pairs = find_trajectory_files(cdir)
+        except FileNotFoundError as e:
+            print(f"  WARNING: Skipping {candidate_name} — {e}")
+            continue
+
+        all_results[candidate_name] = {r: {} for r in RADII}
+
+        for radius in RADII:
+            for state, (pdb, dcd) in pairs.items():
+                print(f"  radius={radius}Å  state={state} ...", end=" ", flush=True)
+                counts = count_waters_per_frame(pdb, dcd, radius)
+                all_results[candidate_name][radius][state] = counts
+                print(f"done ({len(counts)} frames, mean={counts.mean():.1f})")
+
+    if not all_results:
+        raise RuntimeError("No candidates were successfully processed. Check your folder structure.")
+
+    # Save 
+    for radius in RADII:
+        rows = []
+        for candidate_name, radius_data in all_results.items():
+            for state, counts in radius_data[radius].items():
+                for frame_idx, count in enumerate(counts):
+                    rows.append({
+                        "candidate": candidate_name,
+                        "state": state,
+                        "frame": frame_idx,
+                        "radius_A": radius,
+                        "water_count": count,
+                    })
+        df = pd.DataFrame(rows)
+        csv_path = os.path.join(output_dir, f"water_counts_radius_{int(radius)}A.csv")
+        df.to_csv(csv_path, index=False)
+        print(f"\nSaved CSV: {csv_path}")
+
+    # Summary statistics
+    summary_rows = []
+    for candidate_name, radius_data in all_results.items():
+        for radius, state_data in radius_data.items():
+            for state, counts in state_data.items():
+                summary_rows.append({
+                    "candidate": candidate_name,
+                    "state": state,
+                    "radius_A": radius,
+                    "mean": round(counts.mean(), 2),
+                    "median": round(np.median(counts), 2),
+                    "std": round(counts.std(), 2),
+                    "min": int(counts.min()),
+                    "max": int(counts.max()),
+                    "n_frames": len(counts),
+                })
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(output_dir, "summary_statistics.csv")
+    summary_df.to_csv(summary_path, index=False)
+    print(f"\nSaved summary: {summary_path}")
+    print("\n Summary statistics")
+    print(summary_df.to_string(index=False))
+
+    # Mann-Whitney U test 
+    stats_rows = []
+    for candidate_name, radius_data in all_results.items():
+        for radius, state_data in radius_data.items():
+            if "apo" in state_data and "holo" in state_data:
+                stat, p = mannwhitneyu(
+                    state_data["apo"], state_data["holo"],
+                    alternative="two-sided"
+                )
+                stats_rows.append({
+                    "candidate": candidate_name,
+                    "radius_A": radius,
+                    "U_statistic": round(stat, 1),
+                    "p_value": round(p, 4),
+                    "significant_p005": p < 0.05,
+                })
+    stats_df = pd.DataFrame(stats_rows)
+    stats_path = os.path.join(output_dir, "statistical_tests.csv")
+    stats_df.to_csv(stats_path, index=False)
+    print(f"\nSaved stats: {stats_path}")
+    print("\n Mann-Whitney U tests (apo vs holo)")
+    print(stats_df.to_string(index=False))
+
+    # Plots
+    generate_per_candidate_boxplots(all_results, output_dir)
+    generate_combined_boxplots(all_results, output_dir)
+
+    print(f"\nAll outputs saved to: {output_dir}")
+
+
+# Plotting 
+
+APO_COLOR  = "#4C9BE8"
+HOLO_COLOR = "#E8724C"
+BOX_OFFSET = 0.2
+BOX_WIDTH  = 0.32
+HALF_W     = BOX_WIDTH / 2
+
+
+def significance_label(p):
+    """Convert p-value to asterisk annotation string."""
+    if p < 0.0001:
+        return "****"
+    elif p < 0.001:
+        return "***"
+    elif p < 0.01:
+        return "**"
+    elif p < 0.05:
+        return "*"
+    else:
+        return "ns"
+
+
+def add_significance_bracket(ax, x1, x2, y_top, label, color="black", fontsize=10):
+
+    tick = y_top * 0.03
+    ax.plot([x1, x1, x2, x2],
+            [y_top - tick, y_top, y_top, y_top - tick],
+            lw=1.0, color=color)
+    ax.text((x1 + x2) / 2, y_top + tick * 0.5, label,
+            ha="center", va="bottom", fontsize=fontsize, color=color)
+
+
+def style_bp(bp, color):
+    for element in ["boxes", "whiskers", "caps", "fliers"]:
+        plt.setp(bp[element], color=color)
+    plt.setp(bp["boxes"], linewidth=1.5)
+    plt.setp(bp["medians"], linewidth=2, color="white")
+    for patch in bp["boxes"]:
+        patch.set(facecolor=color, alpha=0.75)
+
+
+def draw_single_candidate_on_ax(ax, state_data, candidate_name, radius):
+
+    flier_props = dict(marker="o", markersize=3, alpha=0.4)
+
+    apo_data  = state_data.get("apo")
+    holo_data = state_data.get("holo")
+
+    apo_pos  = -BOX_OFFSET
+    holo_pos =  BOX_OFFSET
+
+    if apo_data is not None:
+        bp_apo = ax.boxplot([apo_data], positions=[apo_pos],
+                            widths=BOX_WIDTH, patch_artist=True,
+                            notch=False, showfliers=True, flierprops=flier_props)
+        style_bp(bp_apo, APO_COLOR)
+        ax.plot([apo_pos - HALF_W, apo_pos + HALF_W],
+                [apo_data.mean(), apo_data.mean()],
+                color="white", linewidth=2, linestyle="--", zorder=5)
+
+    if holo_data is not None:
+        bp_holo = ax.boxplot([holo_data], positions=[holo_pos],
+                             widths=BOX_WIDTH, patch_artist=True,
+                             notch=False, showfliers=True, flierprops=flier_props)
+        style_bp(bp_holo, HOLO_COLOR)
+        ax.plot([holo_pos - HALF_W, holo_pos + HALF_W],
+                [holo_data.mean(), holo_data.mean()],
+                color="white", linewidth=2, linestyle="--", zorder=5)
+
+    y_max_global = max(
+        apo_data.max() if apo_data is not None else 0,
+        holo_data.max() if holo_data is not None else 0,
+    )
+
+    if apo_data is not None and holo_data is not None:
+        _, p = mannwhitneyu(apo_data, holo_data, alternative="two-sided")
+        bracket_y = y_max_global * 1.08
+        add_significance_bracket(ax, apo_pos, holo_pos, bracket_y,
+                                 significance_label(p), fontsize=11)
+
+    ax.set_xticks([0])
+    ax.set_xticklabels([candidate_name], fontsize=11)
+    ax.set_ylabel(f"Water molecules within {int(radius)} Å of 2OG FE2", fontsize=12)
+    ax.set_ylim(bottom=0, top=y_max_global * 1.35)
+    ax.set_xlim(-0.6, 0.6)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    legend_patches = [
+        mpatches.Patch(facecolor=APO_COLOR,  alpha=0.75, label="Apo (protein + 2OG)"),
+        mpatches.Patch(facecolor=HOLO_COLOR, alpha=0.75, label="Holo (+ ligand)"),
+    ]
+    mean_line   = plt.Line2D([0], [0], color="gray", linewidth=2,
+                             linestyle="--", label="Mean")
+    median_line = plt.Line2D([0], [0], color="gray", linewidth=2,
+                             linestyle="-",  label="Median")
+    ax.legend(handles=legend_patches + [median_line, mean_line],
+              frameon=False, fontsize=10, loc="upper left")
+
+    return y_max_global
+
+
+def generate_per_candidate_boxplots(all_results, output_dir):
+
+    for candidate_name, radius_data in all_results.items():
+        cand_out = os.path.join(output_dir, candidate_name)
+        os.makedirs(cand_out, exist_ok=True)
+
+        for radius, state_data in radius_data.items():
+            fig, ax = plt.subplots(figsize=(5, 6))
+            draw_single_candidate_on_ax(ax, state_data, candidate_name, radius)
+            ax.set_title(
+                f"Active site water occupancy — {int(radius)} Å radius\n"
+                f"({candidate_name})",
+                fontsize=13, pad=12,
+            )
+            plt.tight_layout()
+            plot_path = os.path.join(cand_out, f"boxplot_radius_{int(radius)}A.png")
+            fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved plot: {plot_path}")
+
+
+def generate_combined_boxplots(all_results, output_dir):
+    """
+    One combined plot per radius, showing all candidates side by side.
+    Each candidate gets its own apo and holo pair of boxes.
+    """
+    candidate_names = list(all_results.keys())
+    n_candidates = len(candidate_names)
+    spacing = 1.2  
+
+    for radius in RADII:
+        fig_width = max(6, 3 * n_candidates)
+        fig, ax = plt.subplots(figsize=(fig_width, 6))
+        flier_props = dict(marker="o", markersize=3, alpha=0.4)
+
+        y_max_global = 0
+
+        for i, candidate_name in enumerate(candidate_names):
+            state_data = all_results[candidate_name][radius]
+            centre = i * spacing
+
+            apo_data  = state_data.get("apo")
+            holo_data = state_data.get("holo")
+
+            apo_pos  = centre - BOX_OFFSET
+            holo_pos = centre + BOX_OFFSET
+
+            if apo_data is not None:
+                bp_apo = ax.boxplot([apo_data], positions=[apo_pos],
+                                    widths=BOX_WIDTH, patch_artist=True,
+                                    notch=False, showfliers=True,
+                                    flierprops=flier_props)
+                style_bp(bp_apo, APO_COLOR)
+                ax.plot([apo_pos - HALF_W, apo_pos + HALF_W],
+                        [apo_data.mean(), apo_data.mean()],
+                        color="white", linewidth=2, linestyle="--", zorder=5)
+                y_max_global = max(y_max_global, apo_data.max())
+
+            if holo_data is not None:
+                bp_holo = ax.boxplot([holo_data], positions=[holo_pos],
+                                     widths=BOX_WIDTH, patch_artist=True,
+                                     notch=False, showfliers=True,
+                                     flierprops=flier_props)
+                style_bp(bp_holo, HOLO_COLOR)
+                ax.plot([holo_pos - HALF_W, holo_pos + HALF_W],
+                        [holo_data.mean(), holo_data.mean()],
+                        color="white", linewidth=2, linestyle="--", zorder=5)
+                y_max_global = max(y_max_global, holo_data.max())
+
+            # Significance bracket per candidate
+            if apo_data is not None and holo_data is not None:
+                _, p = mannwhitneyu(apo_data, holo_data, alternative="two-sided")
+                bracket_y = y_max_global * 1.08
+                add_significance_bracket(ax, apo_pos, holo_pos, bracket_y,
+                                         significance_label(p), fontsize=10)
+
+        # Axes
+        ax.set_xticks([i * spacing for i in range(n_candidates)])
+        ax.set_xticklabels(candidate_names, fontsize=10, rotation=15, ha="right")
+        ax.set_ylabel(f"Water molecules within {int(radius)} Å of 2OG FE2", fontsize=12)
+        ax.set_ylim(bottom=0, top=y_max_global * 1.40)
+        ax.set_xlim(-0.6, (n_candidates - 1) * spacing + 0.6)
+        ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_title(
+            f"Active site water occupancy — {int(radius)} Å radius (all candidates)",
+            fontsize=13, pad=12,
+        )
+
+        legend_patches = [
+            mpatches.Patch(facecolor=APO_COLOR,  alpha=0.75, label="Apo (protein + 2OG)"),
+            mpatches.Patch(facecolor=HOLO_COLOR, alpha=0.75, label="Holo (+ ligand)"),
+        ]
+        mean_line   = plt.Line2D([0], [0], color="gray", linewidth=2,
+                                 linestyle="--", label="Mean")
+        median_line = plt.Line2D([0], [0], color="gray", linewidth=2,
+                                 linestyle="-",  label="Median")
+        ax.legend(handles=legend_patches + [median_line, mean_line],
+                  frameon=False, fontsize=10, loc="upper left")
+
+        plt.tight_layout()
+        combined_path = os.path.join(output_dir, f"combined_boxplot_radius_{int(radius)}A.png")
+        fig.savefig(combined_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved combined plot: {combined_path}")
+
+        if radius == 6.0:
+            fig2, ax2 = plt.subplots(figsize=(fig_width, 6))
+            # Redraw for high-res version
+            y_max_global2 = 0
+            for i, candidate_name in enumerate(candidate_names):
+                state_data = all_results[candidate_name][radius]
+                centre = i * spacing
+                apo_data  = state_data.get("apo")
+                holo_data = state_data.get("holo")
+                apo_pos  = centre - BOX_OFFSET
+                holo_pos = centre + BOX_OFFSET
+                if apo_data is not None:
+                    bp_apo = ax2.boxplot([apo_data], positions=[apo_pos],
+                                         widths=BOX_WIDTH, patch_artist=True,
+                                         notch=False, showfliers=True,
+                                         flierprops=flier_props)
+                    style_bp(bp_apo, APO_COLOR)
+                    ax2.plot([apo_pos - HALF_W, apo_pos + HALF_W],
+                             [apo_data.mean(), apo_data.mean()],
+                             color="white", linewidth=2, linestyle="--", zorder=5)
+                    y_max_global2 = max(y_max_global2, apo_data.max())
+                if holo_data is not None:
+                    bp_holo = ax2.boxplot([holo_data], positions=[holo_pos],
+                                          widths=BOX_WIDTH, patch_artist=True,
+                                          notch=False, showfliers=True,
+                                          flierprops=flier_props)
+                    style_bp(bp_holo, HOLO_COLOR)
+                    ax2.plot([holo_pos - HALF_W, holo_pos + HALF_W],
+                              [holo_data.mean(), holo_data.mean()],
+                              color="white", linewidth=2, linestyle="--", zorder=5)
+                    y_max_global2 = max(y_max_global2, holo_data.max())
+                if apo_data is not None and holo_data is not None:
+                    _, p = mannwhitneyu(apo_data, holo_data, alternative="two-sided")
+                    bracket_y = y_max_global2 * 1.08
+                    add_significance_bracket(ax2, apo_pos, holo_pos, bracket_y,
+                                             significance_label(p), fontsize=10)
+            ax2.set_xticks([i * spacing for i in range(n_candidates)])
+            ax2.set_xticklabels(candidate_names, fontsize=10, rotation=15, ha="right")
+            ax2.set_ylabel(f"Water molecules within 6 Å of 2OG FE2", fontsize=12)
+            ax2.set_ylim(bottom=0, top=y_max_global2 * 1.40)
+            ax2.set_xlim(-0.6, (n_candidates - 1) * spacing + 0.6)
+            ax2.yaxis.grid(True, linestyle="--", alpha=0.5)
+            ax2.set_axisbelow(True)
+            ax2.spines["top"].set_visible(False)
+            ax2.spines["right"].set_visible(False)
+            ax2.set_title(
+                "Active site water occupancy — 6 Å radius (all candidates)",
+                fontsize=13, pad=12,
+            )
+            ax2.legend(handles=legend_patches + [median_line, mean_line],
+                       frameon=False, fontsize=10, loc="upper left")
+            plt.tight_layout()
+            pub_path = os.path.join(output_dir, "combined_boxplot_6A_publication.png")
+            fig2.savefig(pub_path, dpi=300, bbox_inches="tight")
+            plt.close(fig2)
+            print(f"Saved combined publication figure: {pub_path}")
+
+
+# Entry 
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Count active site waters: apo vs holo (multi-candidate)"
+    )
+    parser.add_argument(
+        "--base_dir", required=True,
+        help="Path to parent folder containing candidate_* subdirectories"
+    )
+    parser.add_argument(
+        "--output_dir", default="water_analysis_output",
+    )
+    args = parser.parse_args()
+
+    run_analysis(base_dir=args.base_dir, output_dir=args.output_dir)
