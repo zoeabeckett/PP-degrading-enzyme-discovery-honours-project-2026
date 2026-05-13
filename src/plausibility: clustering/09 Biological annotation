@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+# Confirm presence of cofactors and catalytically active 
+
+import sys
+import re
+import csv
+import json
+import time
+import argparse
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+
+OG_TERMS = [
+    "2-oxoglutarate",
+    "alpha-ketoglutarate",
+    "α-ketoglutarate",
+    "oxoglutarate",
+    "2-oxo-glutarate",
+    "2og-dependent",
+    "2-oxoglutarate-dependent",
+    "2-oxoglutarate dependent",
+    "fe2og",
+    "2og dioxygenase",
+    "2-oxoglutarate dioxygenase",
+    "2og iron",
+    "oxoglutarate-dependent dioxygenase",
+    "oxoglutarate dependent dioxygenase",
+    "2-odd",        
+    "2odd",
+]
+
+IRON_TERMS = [
+    "iron",
+    "fe2+",
+    "fe3+",
+    "fe(2+)",
+    "fe(3+)",
+    "iron(2+)",
+    "iron(3+)",
+    "ferrous",
+    "ferric",
+    "non-heme iron",
+    "fe2og",        
+]
+
+# Ascorbate terms — informational only, does not affect classification
+ASCORBATE_TERMS = [
+    "ascorbate",
+    "ascorbic acid",
+    "vitamin c",
+    "l-ascorbate",
+    "ascorbate-dependent",
+    "ascorbate peroxidase",
+]
+
+# suggest annotation is uncertain move to FLAGGED
+UNCERTAINTY_TERMS = [
+    "by similarity",
+    "probable",
+    "putative",
+    "potential",
+    "inferred",
+    "predicted",
+    "may bind",
+    "may interact",
+    "possibly",
+    "uncertain",
+    "might",
+]
+
+def parse_fasta(filepath: str) -> list:
+    proteins = []
+    current_header = None
+    current_seq = []
+
+    with open(filepath) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith(">"):
+                if current_header:
+                    proteins.append(_make_record(current_header, "".join(current_seq)))
+                current_header = line[1:]
+                current_seq = []
+            elif current_header:
+                current_seq.append(line)
+
+    if current_header:
+        proteins.append(_make_record(current_header, "".join(current_seq)))
+
+    return proteins
+
+
+def _make_record(header: str, sequence: str) -> dict:
+    accession = _extract_accession(header)
+    return {"accession": accession, "header": header, "sequence": sequence}
+
+
+def _extract_accession(header: str) -> str:
+    m = re.match(r"(?:sp|tr|up)\|([A-Z][A-Z0-9]{4,9})\|", header)
+    if m:
+        return m.group(1)
+    first = header.split()[0]
+    if re.match(r"^[A-Z][A-Z0-9]{4,9}$", first):
+        return first
+    return first
+
+
+UNIPROT_URL = "https://rest.uniprot.org/uniprotkb/{acc}.json"
+
+
+def fetch_uniprot(accession: str, cache: dict, delay: float, retries: int = 3):
+    if accession in cache:
+        return cache[accession]
+
+    url = UNIPROT_URL.format(acc=accession)
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode())
+                cache[accession] = data
+                time.sleep(delay)
+                return data
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                cache[accession] = None
+                return None
+            wait = delay * (2 ** attempt)
+            print(f"    [WARN] HTTP {e.code} for {accession}, retrying in {wait:.1f}s ...", file=sys.stderr)
+            time.sleep(wait)
+        except Exception as e:
+            wait = delay * (2 ** attempt)
+            print(f"    [WARN] {e} for {accession}, retrying in {wait:.1f}s ...", file=sys.stderr)
+            time.sleep(wait)
+
+    cache[accession] = None
+    return None
+
+
+def extract_annotation_text(entry: dict) -> list:
+
+    blocks = []
+
+    for comment in entry.get("comments", []):
+        ctype = comment.get("commentType", "")
+
+        if ctype == "COFACTOR":
+            for cofactor in comment.get("cofactors", []):
+                name = cofactor.get("name", "")
+                if name:
+                    blocks.append(name.lower())
+            note = comment.get("note", {})
+            for text_obj in note.get("texts", []):
+                blocks.append(text_obj.get("value", "").lower())
+
+        elif ctype in ("FUNCTION", "CATALYTIC ACTIVITY", "ACTIVITY REGULATION"):
+            for t in comment.get("texts", []):
+                blocks.append(t.get("value", "").lower())
+            reaction = comment.get("reaction", {})
+            blocks.append(reaction.get("name", "").lower())
+
+    for feature in entry.get("features", []):
+        ftype = feature.get("type", "").lower()
+        if any(k in ftype for k in ("metal", "binding", "active", "site")):
+            desc = feature.get("description", "")
+            blocks.append(desc.lower())
+            for ev in feature.get("evidences", []):
+                ev_code = ev.get("evidenceCode")
+                if isinstance(ev_code, dict):
+                    label = ev_code.get("label", "")
+                    blocks.append(label.lower())
+
+    for kw in entry.get("keywords", []):
+        blocks.append(kw.get("name", "").lower())
+
+    return [b for b in blocks if b]
+
+
+def extract_name_text(entry: dict, fasta_header: str) -> list:
+
+    names = []
+
+    names.append(fasta_header.lower())
+
+    if entry is None:
+        return names
+
+    try:
+        desc = entry.get("proteinDescription", {})
+
+        rec = desc.get("recommendedName", {})
+        names.append(rec.get("fullName", {}).get("value", "").lower())
+        for s in rec.get("shortNames", []):
+            names.append(s.get("value", "").lower())
+
+        for alt in desc.get("alternativeNames", []):
+            names.append(alt.get("fullName", {}).get("value", "").lower())
+            for s in alt.get("shortNames", []):
+                names.append(s.get("value", "").lower())
+
+        for sub in desc.get("submittedNames", []):
+            names.append(sub.get("fullName", {}).get("value", "").lower())
+
+    except (KeyError, TypeError):
+        pass
+
+    return [n for n in names if n]
+
+
+def search_terms(blocks: list, terms: list) -> tuple:
+    """
+    Returns (found: bool, snippets: list[str]).
+    """
+    found = False
+    snippets = []
+    joined = " | ".join(blocks)
+    for term in terms:
+        if term in joined:
+            found = True
+            idx = joined.find(term)
+            start = max(0, idx - 40)
+            end = min(len(joined), idx + len(term) + 60)
+            snippet = joined[start:end].strip()
+            snippets.append(f"...{snippet}...")
+    seen = set()
+    unique = []
+    for s in snippets:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    return found, unique[:4]
+
+
+def check_ascorbate(blocks: list) -> tuple:
+    return search_terms(blocks, ASCORBATE_TERMS)
+
+
+def get_uncertainty_matches(blocks: list) -> list:
+    joined = " ".join(blocks)
+    return [t for t in UNCERTAINTY_TERMS if t in joined]
+
+
+def classify(has_og: bool, has_iron: bool, uncertain: bool, api_failed: bool) -> str:
+    if api_failed:
+        return "FLAGGED"
+    if has_og and has_iron and not uncertain:
+        return "PASSED"
+    if has_og and has_iron and uncertain:
+        return "FLAGGED"
+    if has_og or has_iron:
+        return "FLAGGED"
+    return "FAILED"
+
+def write_fasta(records: list, filepath: Path):
+    with open(filepath, "w") as fh:
+        for rec in records:
+            fh.write(f">{rec['header']}\n")
+            seq = rec["sequence"]
+            for i in range(0, len(seq), 60):
+                fh.write(seq[i:i+60] + "\n")
+
+# Main
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Filter a FASTA sequence by 2-oxoglutarate and iron annotation via UniProt API."
+    )
+    parser.add_argument("fasta", help="Input FASTA file")
+    parser.add_argument(
+        "--output-dir", "-o", default="cofactor_results",
+        help="Directory for output files (default: cofactor_results/)"
+    )
+    parser.add_argument(
+        "--delay", type=float, default=0.5,
+        help="Seconds between API requests (default: 0.5). Reduce carefully to avoid rate limiting."
+    )
+    args = parser.parse_args()
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_path   = out_dir / "uniprot_cache.json"
+    report_path  = out_dir / "annotation_report.csv"
+    passed_path  = out_dir / "passed.fasta"
+    flagged_path = out_dir / "flagged.fasta"
+    failed_path  = out_dir / "failed.fasta"
+
+    cache = {}
+    if cache_path.exists():
+        with open(cache_path) as fh:
+            cache = json.load(fh)
+        print(f"[INFO] Loaded {len(cache)} cached UniProt entries from {cache_path}")
+
+    proteins = parse_fasta(args.fasta)
+    print(f"[INFO] Parsed {len(proteins)} sequences from {args.fasta}\n")
+
+    passed, flagged, failed = [], [], []
+    report_rows = []
+    n_ascorbate = 0
+
+    for i, prot in enumerate(proteins, 1):
+        acc = prot["accession"]
+        cached_label = " (cached)" if acc in cache else ""
+        print(f"[{i:>4}/{len(proteins)}] {acc}{cached_label}", end=" ... ", flush=True)
+
+        entry = fetch_uniprot(acc, cache, args.delay)
+
+        if entry is None:
+            print("NOT FOUND -> FLAGGED")
+            row = {
+                "accession":          acc,
+                "header":             prot["header"],
+                "result":             "FLAGGED",
+                "has_2og":            False,
+                "has_iron":           False,
+                "og_source":          "",
+                "iron_source":        "",
+                "uncertain":          False,
+                "uncertainty_terms":  "",
+                "has_ascorbate":      False,
+                "ascorbate_evidence": "",
+                "og_evidence":        "N/A - entry not found",
+                "iron_evidence":      "N/A - entry not found",
+                "notes":              "UniProt entry not found, manual check required",
+            }
+            flagged.append(prot)
+
+        else:
+            ann_blocks            = extract_annotation_text(entry)
+            has_og_ann,  og_ann_snips = search_terms(ann_blocks, OG_TERMS)
+            has_iron_ann, fe_ann_snips = search_terms(ann_blocks, IRON_TERMS)
+
+            name_blocks             = extract_name_text(entry, prot["header"])
+            has_og_name,  og_name_snips  = search_terms(name_blocks, OG_TERMS)
+            has_iron_name, fe_name_snips = search_terms(name_blocks, IRON_TERMS)
+
+            has_og   = has_og_ann   or has_og_name
+            has_iron = has_iron_ann or has_iron_name
+
+            if has_og_ann:
+                og_source = "annotation"
+            elif has_og_name:
+                og_source = "name/header"
+            else:
+                og_source = ""
+
+            if has_iron_ann:
+                iron_source = "annotation"
+            elif has_iron_name:
+                iron_source = "name/header"
+            else:
+                iron_source = ""
+
+            og_snips = og_ann_snips   or og_name_snips
+            fe_snips = fe_ann_snips   or fe_name_snips
+
+            has_asc, asc_snips = check_ascorbate(ann_blocks + name_blocks)
+            unc_matches        = get_uncertainty_matches(ann_blocks)
+            uncertain          = len(unc_matches) > 0
+
+            if has_asc:
+                n_ascorbate += 1
+
+            result = classify(has_og, has_iron, uncertain, api_failed=False)
+
+            missing = []
+            if not has_og:
+                missing.append("2-oxoglutarate")
+            if not has_iron:
+                missing.append("iron")
+
+            name_only = []
+            if og_source == "name/header":
+                name_only.append("2-OG from name/header only")
+            if iron_source == "name/header":
+                name_only.append("iron from name/header only")
+
+            if result == "FLAGGED":
+                if uncertain:
+                    notes = f"Uncertain evidence: {', '.join(unc_matches)}"
+                elif name_only:
+                    notes = f"Low-confidence source: {'; '.join(name_only)}"
+                else:
+                    notes = f"Missing annotation for: {', '.join(missing)}"
+            elif result == "FAILED":
+                notes = "No 2-oxoglutarate or iron annotation found"
+            else:
+                notes = "; ".join(name_only) if name_only else ""
+
+            src_tag = " [NAME]" if name_only else ""
+            asc_tag = " [ASC]"  if has_asc   else ""
+            print(
+                f"{result}{src_tag}{asc_tag}  "
+                f"(2OG={'Y' if has_og else 'N'}[{og_source or '-'}], "
+                f"Fe={'Y' if has_iron else 'N'}[{iron_source or '-'}]"
+                f"{', uncertain' if uncertain else ''})"
+            )
+
+            row = {
+                "accession":          acc,
+                "header":             prot["header"],
+                "result":             result,
+                "has_2og":            has_og,
+                "has_iron":           has_iron,
+                "og_source":          og_source,
+                "iron_source":        iron_source,
+                "uncertain":          uncertain,
+                "uncertainty_terms":  "; ".join(unc_matches),
+                "has_ascorbate":      has_asc,
+                "ascorbate_evidence": " | ".join(asc_snips) if asc_snips else "",
+                "og_evidence":        " | ".join(og_snips)  if og_snips  else "none found",
+                "iron_evidence":      " | ".join(fe_snips)  if fe_snips  else "none found",
+                "notes":              notes,
+            }
+
+            if result == "PASSED":
+                passed.append(prot)
+            elif result == "FLAGGED":
+                flagged.append(prot)
+            else:
+                failed.append(prot)
+
+        report_rows.append(row)
+
+
+    write_fasta(passed,  passed_path)
+    write_fasta(flagged, flagged_path)
+    write_fasta(failed,  failed_path)
+
+    fieldnames = [
+        "accession", "header", "result",
+        "has_2og", "has_iron", "og_source", "iron_source",
+        "uncertain", "uncertainty_terms",
+        "has_ascorbate", "ascorbate_evidence",
+        "og_evidence", "iron_evidence", "notes",
+    ]
+    with open(report_path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(report_rows)
+
+    with open(cache_path, "w") as fh:
+        json.dump(cache, fh, indent=2)
+
+# Summary 
+
+    total       = len(proteins)
+    n_name_only = sum(1 for r in report_rows
+                      if r["og_source"] == "name/header" or r["iron_source"] == "name/header")
+
+    print(f"""
+----------------------------------------------------
+                    SUMMARY                       
+----------------------------------------------------
+|  Total sequences    : {total:<26}|
+|  PASSED             : {len(passed):<26}|
+|  FLAGGED            : {len(flagged):<26}|
+|  FAILED             : {len(failed):<26}|
+|  Name/header rescue : {n_name_only:<26}|
+|  Ascorbate-dependent: {n_ascorbate:<26}|
+---------------------------------------------------
+|  Output directory   : {args.output_dir:<26}|
+----------------------------------------------------
+
+
+Files written:
+  {passed_path}
+  {flagged_path}
+  {failed_path}
+  {report_path}
+  {cache_path}
+""")
+
+
+if __name__ == "__main__":
+    main()
