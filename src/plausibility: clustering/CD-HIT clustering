@@ -1,0 +1,205 @@
+import subprocess
+import os
+import sys
+from pathlib import Path
+
+
+# Configuration
+INPUT_FILE  = "uniref_identity_0_5_iron_AND_Oxygena_2026_03_18.fasta"  
+OUTPUT_FILE = "cdhit_clustered"   
+
+
+def run_cdhit(input_file, output_file):
+    """Run CD-HIT with your original parameters via subprocess."""
+
+    if not os.path.exists(input_file):
+        print(f"Input file not found: {input_file}")
+        sys.exit(1)
+
+    cmd = [
+        "cd-hit",
+        "-i",  input_file,
+        "-o",  output_file,
+        "-c",  "0.5",    
+        "-n",  "3",     
+        "-G",  "0",     
+        "-aL", "0.0",    
+        "-aS", "0.9",    
+        "-d",  "0",      
+        "-M",  "5000",   
+        "-T",  "0",     
+        "-sc", "1",    
+        "-sf", "1",     
+    ]
+
+    print(f"Running CD-HIT on {input_file}...")
+    print("Command:", " ".join(cmd))
+    print("-" * 60)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    print(result.stdout)
+
+    if result.returncode != 0:
+        print("CD-HIT failed:")
+        print(result.stderr)
+        sys.exit(1)
+
+    print(f"CD-HIT completed. Output: {output_file}")
+    return result
+
+
+def parse_clstr(clstr_file):
+    """
+    Parse the .clstr output file into a list of clusters.
+    Replacement for pycdhit's read_clstr() function.
+
+    Returns a list of dicts, each with:
+        - cluster_id   : int
+        - size         : int (number of members)
+        - representative: str (sequence header of the rep)
+        - members      : list of dicts with 'name', 'length', 'identity'
+    """
+    clusters = []
+    current_cluster = None
+
+    with open(clstr_file, "r") as f:
+        for line in f:
+            line = line.strip()
+
+            if line.startswith(">Cluster"):
+                # Save previous cluster
+                if current_cluster is not None:
+                    current_cluster["size"] = len(current_cluster["members"])
+                    clusters.append(current_cluster)
+                cluster_id = int(line.split()[1])
+                current_cluster = {
+                    "cluster_id":    cluster_id,
+                    "size":          0,
+                    "representative": None,
+                    "members":       []
+                }
+
+            elif line and current_cluster is not None:
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    continue
+
+                info    = parts[1]
+                is_rep  = info.strip().endswith("*")
+
+                length  = int(info.split("aa")[0].strip())
+
+                name_part = info.split(">")[1] if ">" in info else ""
+                name = name_part.split("...")[0].strip()
+
+                if is_rep:
+                    identity = 100.0
+                else:
+                    id_part  = info.split(" at ")[-1].strip().rstrip("%")
+                    try:
+                        identity = float(id_part)
+                    except ValueError:
+                        identity = None
+
+                member = {
+                    "name":     name,
+                    "length":   length,
+                    "identity": identity,
+                    "is_rep":   is_rep
+                }
+                current_cluster["members"].append(member)
+
+                if is_rep:
+                    current_cluster["representative"] = name
+
+    if current_cluster is not None:
+        current_cluster["size"] = len(current_cluster["members"])
+        clusters.append(current_cluster)
+
+    return clusters
+
+
+def summarise_clusters(clusters, output_tsv="cluster_summary.tsv"):
+    """
+    Print a summary and write a TSV with one row per cluster.
+    Columns: cluster_id, size, representative, all_members
+    """
+    total_seqs = sum(c["size"] for c in clusters)
+    singletons = sum(1 for c in clusters if c["size"] == 1)
+
+    print(f"\n{'='*60}")
+    print(f"Clustering summary")
+    print(f"{'='*60}")
+    print(f"  Input sequences:  {total_seqs}")
+    print(f"  Clusters formed:  {len(clusters)}")
+    print(f"  Singleton clusters (size=1): {singletons}")
+    print(f"  Redundancy removed: {total_seqs - len(clusters)} sequences")
+    print(f"  Sequences kept as representatives: {len(clusters)}")
+
+    with open(output_tsv, "w") as f:
+        f.write("cluster_id\tsize\trepresentative\tmembers\n")
+        for c in clusters:
+            members_str = ";".join(m["name"] for m in c["members"])
+            f.write(
+                f"{c['cluster_id']}\t{c['size']}\t"
+                f"{c['representative']}\t{members_str}\n"
+            )
+
+    print(f"\n  Cluster summary written to: {output_tsv}")
+
+    sorted_clusters = sorted(clusters, key=lambda x: x["size"], reverse=True)
+    print(f"\n  Top 10 largest clusters:")
+    print(f"  {'Cluster':>10}  {'Size':>6}  Representative")
+    print(f"  {'-'*50}")
+    for c in sorted_clusters[:10]:
+        print(f"  {c['cluster_id']:>10}  {c['size']:>6}  {c['representative']}")
+
+
+def extract_representatives(clstr_file, input_fasta, output_fasta):
+    """
+    Extracts representative sequences from the input FASTA. Produces the non-redundant FASTA for
+    MMseqs2.
+    """
+    
+    clusters   = parse_clstr(clstr_file)
+    rep_names  = set(c["representative"] for c in clusters if c["representative"])
+
+    print(f"\nExtracting {len(rep_names)} representative sequences...")
+
+    found   = 0
+    writing = False
+
+    with open(input_fasta, "r") as fin, open(output_fasta, "w") as fout:
+        for line in fin:
+            if line.startswith(">"):
+                # Check if this header matches a representative
+                header = line[1:].split()[0].strip()
+                writing = header in rep_names
+                if writing:
+                    found += 1
+            if writing:
+                fout.write(line)
+
+    print(f"Wrote {found} representative sequences to {output_fasta}")
+
+
+# Main 
+if __name__ == "__main__":
+
+    # CD-HIT run
+    run_cdhit(INPUT_FILE, OUTPUT_FILE)
+
+    # Parse cluster file
+    clstr_file = OUTPUT_FILE + ".clstr"
+    clusters   = parse_clstr(clstr_file)
+
+    # Print summary and tsv output 
+    summarise_clusters(clusters, output_tsv="cluster_summary.tsv")
+
+    # Extract representatives from each cluster
+    extract_representatives(
+        clstr_file   = clstr_file,
+        input_fasta  = INPUT_FILE,
+        output_fasta = "representatives.fasta"
+    )
