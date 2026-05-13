@@ -1,1 +1,131 @@
+"""
+Filters by two metrics: 
+  1. Mean of per-pose minimum Fe-C distances (consistency across poses)
+  2. Best single pose minimum Fe-C distance (closest approach)
 
+
+How to use:
+    python filter_enzyme_distances.py
+    python filter_enzyme_distances.py --mean_thresh 7.0 --best_thresh 5.0
+"""
+
+import argparse
+import pandas as pd
+import numpy as np
+import os
+
+# --- CONFIGURATION ---
+INPUT_CSV  = 'input'
+OUTPUT_DIR = 'output path'
+
+
+DEFAULT_MEAN_THRESH = 8.0   
+DEFAULT_BEST_THRESH = 6.0   
+
+
+def summarise(df):
+    records = []
+    for enzyme_id, group in df.groupby('Enzyme_ID'):
+        best_row = group.loc[group['Min_Dist_C_Fe'].idxmin()]
+        records.append({
+            'Enzyme_ID':        enzyme_id,
+            'N_Poses':          len(group),
+            'Mean_MinDist_Fe':  group['Min_Dist_C_Fe'].mean(),
+            'Std_MinDist_Fe':   group['Min_Dist_C_Fe'].std(),
+            'Best_MinDist_Fe':  group['Min_Dist_C_Fe'].min(),
+            'Best_Pose_ID':     int(best_row['Pose_ID']),
+            'Mean_C_within_5A': group['N_C_within_5A'].mean(),
+            'Best_C_within_5A': group['N_C_within_5A'].max(),
+            'Mean_C_within_4A': group['N_C_within_4A'].mean(),
+            'Best_C_within_4A': group['N_C_within_4A'].max(),
+        })
+    return pd.DataFrame(records)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Filter enzyme docking results by Fe-C distance metrics"
+    )
+    parser.add_argument('--input',        default=INPUT_CSV,
+        help=f"Input CSV (default: {INPUT_CSV})")
+    parser.add_argument('--outdir',       default=OUTPUT_DIR,
+        help=f"Output directory (default: {OUTPUT_DIR})")
+    parser.add_argument('--mean_thresh',  type=float, default=DEFAULT_MEAN_THRESH,
+        help=f"Max allowed mean of pose minimums in A (default: {DEFAULT_MEAN_THRESH})")
+    parser.add_argument('--best_thresh',  type=float, default=DEFAULT_BEST_THRESH,
+        help=f"Max allowed best single pose minimum in A (default: {DEFAULT_BEST_THRESH})")
+    args = parser.parse_args()
+
+    # Load files 
+    if not os.path.exists(args.input):
+        print(f"ERROR: Input file not found: {args.input}")
+        return
+
+    df_raw = pd.read_csv(args.input)
+    print(f"Loaded {len(df_raw)} pose rows for "
+          f"{df_raw['Enzyme_ID'].nunique()} enzymes\n")
+
+    # Summary distance metrics
+    df = summarise(df_raw)
+    df = df.sort_values('Best_MinDist_Fe', ascending=True).reset_index(drop=True)
+
+    # Apply thresholds
+    passes_mean = df['Mean_MinDist_Fe'] <= args.mean_thresh
+    passes_best = df['Best_MinDist_Fe'] <= args.best_thresh
+    df['Passes_Mean_Filter'] = passes_mean
+    df['Passes_Best_Filter'] = passes_best
+    df['Passes_Both']        = passes_mean & passes_best
+
+    hits = df[df['Passes_Both']].copy()
+
+    # Summary table outputted
+    print(f"Thresholds applied:")
+    print(f"  Mean of pose minimums <= {args.mean_thresh} A")
+    print(f"  Best single pose      <= {args.best_thresh} A")
+    print()
+    print(f"{'Enzyme':<20} {'Mean':>8} {'Std':>6} {'Best':>8} "
+          f"{'BestPose':>9} {'C<=5A(best)':>12} {'Pass':>6}")
+    print("-" * 75)
+
+    for _, row in df.iterrows():
+        flag = "YES" if row['Passes_Both'] else (
+               "mean" if not row['Passes_Mean_Filter'] else "best")
+        print(f"  {row['Enzyme_ID']:<18} "
+              f"{row['Mean_MinDist_Fe']:>8.2f} "
+              f"{row['Std_MinDist_Fe']:>6.2f} "
+              f"{row['Best_MinDist_Fe']:>8.2f} "
+              f"{int(row['Best_Pose_ID']):>9} "
+              f"{int(row['Best_C_within_5A']):>12} "
+              f"{'  '+flag:>6}")
+
+    # Save
+    os.makedirs(args.outdir, exist_ok=True)
+
+    out_all  = os.path.join(args.outdir, 'filtered_enzyme_distances.csv')
+    out_hits = os.path.join(args.outdir, 'hits_enzyme_distances.csv')
+
+    df.to_csv(out_all, index=False)
+    hits.to_csv(out_hits, index=False)
+
+    print(f"\n{'='*55}")
+    print(f"  Total enzymes     : {len(df)}")
+    print(f"  Pass mean filter  : {passes_mean.sum()}  (<= {args.mean_thresh} A)")
+    print(f"  Pass best filter  : {passes_best.sum()}  (<= {args.best_thresh} A)")
+    print(f"  Pass BOTH         : {len(hits)}")
+    print(f"{'='*55}")
+    print(f"\n  All results : {out_all}")
+    print(f"  Hits only   : {out_hits}")
+
+    if len(hits) > 0:
+        print(f"\nTop hits:")
+        print(hits[['Enzyme_ID', 'Mean_MinDist_Fe', 'Best_MinDist_Fe',
+                     'Best_Pose_ID', 'Best_C_within_5A']].to_string(index=False))
+    else:
+        print(f"\nNo enzymes passed both filters.")
+        print(f"Try relaxing thresholds with --mean_thresh and --best_thresh")
+        print(f"Closest enzyme overall:")
+        print(df[['Enzyme_ID', 'Mean_MinDist_Fe', 'Best_MinDist_Fe']].head(5).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
