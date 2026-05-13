@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+# example script ran on HIS1 
+
+import argparse
+import os
+import sys
+import subprocess
+
+
+DEFAULT_CANDIDATES = ["X"]
+
+STRIP_RESNAMES     = {"HOH", "WAT", "TIP3", "Na+", "Cl-", "K+", "Mg+", "Ca+"}
+
+# Cofactors for the Non-Heme system
+COFACTOR_RESNAMES  = {"2OG", "FE", "FE2"} 
+
+LIG_RESNAME_IN     = "UNK"
+LIG_RESNAME_OUT    = "LIG"
+
+# Histidine handling
+HIS_DEFAULT_STATE  = "HIE"
+# NOTE: If iron binding histidines fail in tleap, identify their residue 
+# numbers and add them here. Example: {152: "HID", 155: "HID"}
+HIS_OVERRIDES      = {}   
+
+STD_AA = {
+    "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY",
+    "HIE","HID","HIP","HIS","ILE","LEU","LYS","MET",
+    "PHE","PRO","SER","THR","TRP","TYR","VAL"
+}
+
+
+def get_pdb_path(name):
+    # This will look for positive_control/trajectory_positive_control_holo.pdb
+    return os.path.join(name, f"trajectory_{name}_holo.pdb")
+
+def get_out_dir(name):
+    return os.path.join("mmpbsa_results", name)
+
+def detect_terminal_renames(raw_lines):
+    renames = {}
+    atom_lines = [l for l in raw_lines if l[:6].strip() in ("ATOM", "HETATM") and len(l) >= 20]
+    if not atom_lines: return renames
+    first = atom_lines[0][17:20].strip()
+    if first not in STD_AA and first not in list(COFACTOR_RESNAMES) + [LIG_RESNAME_IN]:
+        if first.startswith("N") and first[1:] in STD_AA: renames[first] = first[1:]
+        elif len(first) >= 3: renames[first] = first[:3]
+    protein_lines = [l for l in atom_lines if l[17:20].strip() not in list(COFACTOR_RESNAMES) + [LIG_RESNAME_IN, "HOH"]]
+    if protein_lines:
+        last = protein_lines[-1][17:20].strip()
+        if last not in STD_AA:
+            if last.startswith("C") and last[1:] in STD_AA: renames[last] = last[1:]
+            elif len(last) >= 3: renames[last] = last[:3]
+    return renames
+
+def clean_pdb(input_pdb, terminal_renames):
+    kept_lines, all_renamed_lines = [], []
+    prot, cofac, lig = set(), set(), set()
+    with open(input_pdb) as f:
+        raw = f.readlines()
+    auto_renames = detect_terminal_renames(raw)
+    auto_renames.update(terminal_renames)
+    
+    for line in raw:
+        rec = line[:6].strip()
+        if rec in ("CONECT", "ANISOU", "SIGUIJ", "MASTER", "END"):
+            all_renamed_lines.append(line)
+            continue
+        if rec in ("ATOM", "HETATM"):
+            resname = line[17:20].strip()
+            resnum  = line[22:26].strip()
+            chain   = line[21].strip()
+            if resname == LIG_RESNAME_IN:
+                resname = LIG_RESNAME_OUT
+                line = line[:17] + f"{LIG_RESNAME_OUT:<3s}" + line[20:]
+            if resname in auto_renames:
+                new_res = auto_renames[resname]
+                resname = new_res
+                line = line[:17] + f"{new_res:<3s}" + line[20:]
+            if resname == "HIS":
+                try: rn = int(resnum)
+                except: rn = -1
+                state = HIS_OVERRIDES.get(rn, HIS_DEFAULT_STATE)
+                line = line[:17] + f"{state:<3s}" + line[20:]
+                resname = state
+            all_renamed_lines.append(line)
+            if resname in STRIP_RESNAMES: continue
+            key = (resname, chain, resnum)
+            if resname in COFACTOR_RESNAMES: cofac.add(key)
+            elif resname == LIG_RESNAME_OUT: lig.add(key)
+            else: prot.add(key)
+            kept_lines.append(line)
+        else:
+            all_renamed_lines.append(line)
+            kept_lines.append(line)
+    return kept_lines, all_renamed_lines, prot, cofac, lig
+
+def filter_lines(lines, keep_resnames):
+    out = [l for l in lines if (l[:6].strip() not in ("ATOM", "HETATM")) or (l[17:20].strip() in keep_resnames)]
+    out.append("END\n")
+    return out
+
+def write_pdb(lines, path):
+    with open(path, "w") as f: f.writelines(lines)
+    print(f"  Written: {path}")
+
+def process_candidate(name):
+    pdb = get_pdb_path(name)
+    out_dir = get_out_dir(name)
+    if not os.path.isfile(pdb):
+        print(f"  ERROR: PDB not found at: {pdb}")
+        return False
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"  Processing {name}...")
+
+    # PDB4AMBER
+    p4out = os.path.join(out_dir, "pdb4amber_out.pdb")
+    try:
+        subprocess.run(["pdb4amber", "-i", pdb, "-o", p4out], 
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except:
+        print("  ERROR: pdb4amber failed.")
+        return False
+
+    # Clean
+    lines, all_renamed, prot_set, cofac_set, lig_set = clean_pdb(p4out, {})
+    
+    # Outputs
+    write_pdb(all_renamed, os.path.join(out_dir, "pdb4amber_lig.pdb"))
+    
+    prot_res = set(r[0] for r in prot_set)
+    cofac_res = set(r[0] for r in cofac_set)
+    
+    write_pdb(filter_lines(lines, prot_res | cofac_res | {LIG_RESNAME_OUT}), os.path.join(out_dir, "complex_clean.pdb"))
+    write_pdb(filter_lines(lines, prot_res | cofac_res), os.path.join(out_dir, "receptor_clean.pdb"))
+    write_pdb(filter_lines(lines, {LIG_RESNAME_OUT}), os.path.join(out_dir, "ligand_clean.pdb"))
+    return True
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--candidate", nargs="*", default=None)
+    args = parser.parse_args()
+    targets = args.candidate if args.candidate else DEFAULT_CANDIDATES
+    for t in targets:
+        process_candidate(t)
+
+if __name__ == "__main__":
+    main()
