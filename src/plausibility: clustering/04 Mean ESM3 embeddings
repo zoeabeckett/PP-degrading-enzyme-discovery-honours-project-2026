@@ -7,12 +7,14 @@ input_folder = "X"
 output_matrix = "05_protein_embeddings_matrix.npy"
 output_labels = "05_protein_labels.npy"
 
+# Gather files together 
 files = [f for f in os.listdir(input_folder) if f.endswith(".pt")]
 print(f"Found {len(files)} embedding files.")
 
 all_vectors = []
 all_labels = []
 
+# Loop and extract embeddings 
 print("Aggregating embeddings...")
 for filename in tqdm(files):
     path = os.path.join(input_folder, filename)
@@ -29,7 +31,7 @@ for filename in tqdm(files):
     except Exception as e:
         print(f"Skipping {filename}: {e}")
 
---
+
 # Convert list of vectors into one big 2D Matrix (N_proteins x N_dimensions)
 X = np.vstack(all_vectors)
 y = np.array(all_labels)
